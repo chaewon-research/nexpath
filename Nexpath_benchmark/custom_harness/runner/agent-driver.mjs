@@ -1,20 +1,10 @@
 #!/usr/bin/env node
-// Experimental SWE-EVO agent handoff, restricted to the first two
-// unconditional turns (control or nexpath arm). Not an evaluator or a full
-// 20-turn driver.
-//
-// control arm: each frozen prompt goes straight to the agent. NexPath is never invoked.
-// nexpath arm: per turn, `nexpath auto` (UserPromptSubmit) runs BEFORE the agent call,
-//   and `nexpath stop` (Stop) runs AFTER that agent call completes — matching the real
-//   Claude Code hook contract (auto never rewrites the prompt; any enhancement surfaces
-//   later, via stop). Both hooks are invoked by full path to a built CLI, against a
-//   fresh per-run SQLite file — never ~/.nexpath, never the user's Claude settings.
-//   When `stop` accepts guidance (stdout `{"decision":"block","reason":...}`, exit 0 — the
-//   real contract in src/cli/commands/stop.ts), it is delivered to the SAME session as a
-//   separate continuation turn (`--resume`), never by rewriting the frozen prompt. The
-//   continuation's own UserPromptSubmit/Stop fire with `stop_hook_active:true` on the Stop
-//   side, and the chain is capped by --max-continuations (default 2) so a NexPath build that
-//   keeps blocking can never loop this driver forever; hitting the cap is reported, not hidden.
+// Driver for the first two unconditional SWE-EVO turns (control or NexPath).
+// This pilot does not score the benchmark.
+// Control prompts go directly to Claude Code.
+// For NexPath, UserPromptSubmit runs before the agent and Stop afterward.
+// Accepted Stop guidance resumes the same session in a bounded continuation.
+
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
@@ -95,12 +85,9 @@ for (const [i, row] of rows.entries()) {
   }
 }
 
-// run-session.mjs's own nexpath-arm rows always carry its hook-outcome fields (set, even when
-// null, by its unconditional `appendFileSync` — see runner/run-session.mjs). If this driver's
-// nexpath arm then ran its OWN auto/stop calls over the same raw prompts, NexPath would decide
-// on the same conversation twice under two different sessions/databases — a silent double
-// intervention, not a resume of the first one. Reject rather than let that happen quietly; a
-// plain {turn, raw_prompt} handoff (what this driver actually consumes) never has these keys.
+// Do not invoke NexPath twice on the same prompts. NexPath-arm output from
+// run-session.mjs already includes hook results; use a plain {turn, raw_prompt}
+// handoff for this driver.
 if (arm === 'nexpath') {
   const RUN_SESSION_HOOK_OUTCOME_KEYS = ['enhanced_prompt', 'fired_flag', 'pe_status', 'pe_sections', 'keeps_original_verbatim'];
   for (const [i, row] of rows.entries()) {
@@ -170,16 +157,9 @@ function keyFromEnvFile() {
 }
 const { key, from: keyFrom } = noKey ? { key: undefined, from: 'withheld (--no-key)' } : keyFromEnvFile();
 
-// resolveOpenAIKey()'s fallback chain (src/config/ApiKeyResolver.ts) is NOT scoped by --db or
-// by this process's env: after env + the project's own .env, it falls through to the OS
-// keychain, then a 0600 file at `join(homedir(), '.nexpath', 'config.json')`, then a stored
-// Nexpath token — all read inside the nexpath subprocess regardless of what key (if any) we
-// pass it. On a machine where NexPath was ever configured with a real key, that means --no-key
-// does NOT actually withhold it: the subprocess finds it anyway via homedir(). Pointing HOME at
-// an empty, run-local, never-populated directory keeps the FILE fallback layer (and any other
-// homedir()-keyed state) from ever reaching the operator's real ~/.nexpath. The OS keychain
-// layer (`cross-keychain`) is tied to the login session, not $HOME, so it is NOT sandboxed by
-// this — see README "Known limitations". We never read this directory ourselves.
+// NexPath can read credentials from the environment, config files, and OS keychain.
+// Set a fresh HOME to isolate ~/.nexpath/config.json for hook subprocesses.
+// OS-keychain access is not isolated, so --no-key is not a full credential sandbox.
 const nexpathHome = join(out, 'nexpath-home');
 if (arm === 'nexpath') mkdirSync(nexpathHome, { recursive: true }); // control arm never spawns nexpath; nothing to sandbox
 const nexpathEnv = { ...process.env, HOME: nexpathHome };
@@ -191,31 +171,19 @@ function callNexpathHook(cmdArgs, stdinPayload, tag) {
     cwd: project, env: nexpathEnv, encoding: 'utf8',
     input: JSON.stringify(stdinPayload), timeout: nexpathTimeoutSeconds * 1000,
     maxBuffer: 16 * 1024 * 1024,
-    // NexPath's PE/advisory popup opens /dev/tty directly (the CONTROLLING terminal, not fd
-    // 0/1/2) whenever one is reachable (src/cli/prompt-enhancement-host.ts probeDirectTty) —
-    // so without this, running the driver from an interactive shell lets the Stop hook render
-    // its popup straight onto the operator's own terminal while nothing here presses a key for
-    // it. `detached: true` makes this child the leader of its own session (POSIX setsid
-    // semantics), so it starts with NO controlling terminal at all and /dev/tty reliably fails
-    // closed (ENXIO) instead of attaching to ours. Matches what run-session.mjs's pty-run.py
-    // wrapper exists to prevent, by denying any ctty rather than supplying an isolated one.
+    // Detach hook processes from the controlling terminal so NexPath's
+    // /dev/tty popup cannot take over the operator's terminal.
     detached: true,
   });
-  // spawnSync's own `timeout` kill DOES surface as `res.error` (ETIMEDOUT) on current Node, so
-  // it is already caught by the check just below. What it does NOT cover is a kill delivered by
-  // something OTHER than that timeout — an OOM-killer, a crash that raises SIGSEGV/SIGABRT, or
-  // the operator sending a signal by hand — which reports only `res.signal` (status null, no
-  // `error`). Checked explicitly below so that case can never be read as a clean "no guidance".
+  // spawnSync reports its timeout through res.error. External signals
+  // can appear only in res.signal.
   if (res.error) fail(`nexpath ${cmdArgs[0]} failed to spawn: ${res.error.message}`);
   writeFileSync(join(out, `${tag}-stdout.log`), res.stdout || '');
   writeFileSync(join(out, `${tag}-stderr.log`), res.stderr || '');
   const row = { hook: cmdArgs[0], tag, started_at: startedAt, exit_code: res.status, signal: res.signal };
   appendFileSync(join(out, 'nexpath-hooks.jsonl'), JSON.stringify(row) + '\n');
-  // The real hook (src/cli/commands/{auto,stop}.ts) exits 0 on every outcome it recognises —
-  // "no action", blocked, shown, dismissed, even a missing key — so a nonzero exit or an
-  // unexplained signal kill means the hook crashed, hung, or was killed mid-run, never a
-  // legitimate "no guidance". Treating that as benign would let a broken nexpath call silently
-  // decay a nexpath-arm turn into control-arm-like behaviour while the run still reports success.
+  // Exit code 0 includes handled no-guidance outcomes; signals and
+  // nonzero exits indicate hook failure.
   if (res.signal) {
     fail(`nexpath ${cmdArgs[0]} (${tag}) was killed by signal ${res.signal} — likely exceeded `
       + `--nexpath-timeout-seconds=${nexpathTimeoutSeconds}; inspect ${tag}-stderr.log in ${out}`);
@@ -272,18 +240,12 @@ let previousTreeSha = startingCommit;
 function writeStepArtifacts(tag, res) {
   writeFileSync(join(out, `${tag}-stdout.json`), res.stdout || '');
   writeFileSync(join(out, `${tag}-stderr.log`), res.stderr || '');
-  // Plain `git diff` (no args) compares the working tree to the INDEX — a file the agent
-  // CREATED but never `git add`ed never appears, not even its filename, let alone content;
-  // git-status.txt would show it as `??` while the patch silently dropped it entirely. Stage
-  // everything first (git add -A still honours .gitignore) and diff TREE objects instead:
-  // `git write-tree` serialises the index with no commit and no author identity required, so
-  // this works even in a checkout with no git user configured.
+  // Stage changes before building patches to include newly created files.
+  // Compare Git trees without creating a commit.
   git('add', '-A');
   const treeSha = git('write-tree').trim();
-  // `${tag}.patch` stays the CUMULATIVE diff since the run's starting commit (every prior
-  // step's edits included) — unchanged in meaning from before, just now complete. The new
-  // `${tag}-incremental.patch` is what THIS step alone changed; without it, every patch after
-  // the first silently included all earlier turns'/continuations' edits as if they were new.
+  // Record both the cumulative patch since the starting commit and
+  // the incremental patch for this step.
   const cumulativeDiff = git('diff', '--binary', startingCommit, treeSha);
   const incrementalDiff = git('diff', '--binary', previousTreeSha, treeSha);
   writeFileSync(join(out, `${tag}.patch`), cumulativeDiff);
@@ -293,12 +255,8 @@ function writeStepArtifacts(tag, res) {
   return { cumulativeDiff, incrementalDiff };
 }
 
-// The real Stop hook (src/cli/commands/stop.ts) prints `{"decision":"block","reason":...}` to
-// stdout and exits 0 ONLY when it is delivering accepted guidance as the next Claude turn;
-// every other outcome (no pending advisory, feedback shown, dismissed, disabled, ...) exits 0
-// with no such line, which Claude Code reads as "stop normally". Mirror that exactly: absence
-// of a decision line is "no guidance" (never a failure), and a decision line that does not match
-// the real shape is "malformed" — reported, but never treated as accepted.
+// Accepted Stop guidance has the shape {"decision":"block","reason":...}.
+// No decision line means no guidance; malformed decisions are reported.
 function parseStopDecision(stdout) {
   const jsonLine = String(stdout || '').split('\n').map((l) => l.trim()).filter(Boolean).reverse()
     .find((l) => l.startsWith('{'));
