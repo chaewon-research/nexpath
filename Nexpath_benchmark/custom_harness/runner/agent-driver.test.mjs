@@ -393,10 +393,8 @@ test('rejects a nexpath-arm handoff that already carries NexPath hook-outcome fi
   assert.match(r.stderr,/fired_flag/);
 });
 
-// ── regression tests: PTY isolation, hook-failure handling, credential isolation, ─────
-//    and accurate (incremental) patch recording. Added after a read-only review found
-//    each of these as a confirmed defect in the real CLI/credential/TTY contracts that
-//    the mocked nexpath-cli above is too simple to exercise.
+// Regression tests for terminal isolation, hook failures, credential
+// handling, and incremental patch recording.
 
 // Reports the probing process's own session id (via `ps -o sid=`), so a test can tell
 // whether the nexpath subprocess shares our controlling terminal (same session) or was
