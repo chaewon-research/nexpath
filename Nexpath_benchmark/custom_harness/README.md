@@ -67,36 +67,26 @@ all. It supports both arms:
   `run-session.mjs` already ran through its nexpath arm) is rejected outright, so the
   live driver can never apply NexPath's hooks a second time over the same prompts.
 
-  Every hook call's exit status is checked: a nonzero exit or a timeout-triggered
-  signal kill fails the whole run loudly instead of being silently read as "no
-  guidance" — a broken or hung NexPath call must never decay a nexpath-arm turn into
-  control-arm-like behaviour while the run still reports success. Each hook call is
-  also spawned detached from any controlling terminal, so NexPath's popup (which opens
-  `/dev/tty` directly) can never attach to the terminal the driver was launched from.
+  Hook calls check exit status and timeouts. A failed NexPath hook fails the
+  NexPath-arm run instead of appearing as a successful no-guidance turn.
+  Hooks are detached to keep popups off the operator's terminal.
 
-  Each step writes two patches: `<tag>.patch` is the CUMULATIVE diff since the run's
-  starting commit (every prior turn/continuation included), and `<tag>-incremental.patch`
-  is just that step's own change. Both are built by staging everything (`git add -A`)
-  and diffing tree objects, so a file the agent newly *created* (never staged by the
-  agent itself) is captured too — a bare `git diff` silently drops untracked files
-  entirely.
+  Each step records a cumulative patch from the starting commit and an
+  incremental patch for that step. Staging changes before generating the
+  patches ensures that new, previously untracked files are included.
 
 ### Known limitations
 
-- **OS keychain is not sandboxed.** `--no-key` and the `$HOME` sandbox used for every
-  nexpath subprocess call keep NexPath from reading `~/.nexpath/config.json`, but
-  NexPath's credential resolver also checks the OS keychain (`cross-keychain`), which is
-  tied to the login session rather than `$HOME`. On a machine where a real OpenAI key
-  was ever stored there (e.g. via `nexpath config set apikey`), a "keyless" run may
-  still use it. `meta.json`'s `credential_isolation.keychain_sandboxed` is always
-  `false` as a reminder. There is no fix for this available from the harness side
-  without changing NexPath's own resolver.
-- **The real popup path is still unverified end-to-end.** Detaching the nexpath
-  subprocess from any controlling terminal stops it from rendering onto the operator's
-  terminal, but it also means a direct-tty popup can never render in that subprocess —
-  consistent with a headless/CI run, but not yet exercised against the real built CLI
-  with a live agent. Only mocked-CLI runs cover the Stop-hook block/continuation path
-  today.
+- **OS keychain is not sandboxed.** A fresh `$HOME` isolates the usual
+  `~/.nexpath/config.json` fallback, but NexPath can still read credentials
+  from the login-session OS keychain. Consequently, `--no-key` does not
+  guarantee a credential-free run on a machine with a stored key.
+  `meta.json` records `keychain_sandboxed: false`. Complete isolation
+  requires a separate environment or a change to NexPath's credential resolver.
+- **Live popup delivery is unverified.** Detached hook processes cannot
+  show interactive `/dev/tty` popups in the operator's terminal. The live
+  guidance/continuation path has not been tested end to end; offline tests
+  exercise it with a mocked CLI.
 
 ```bash
 node runner/agent-driver.mjs --turns=runs/<run-id>/turns.jsonl --project=<checkout> \
