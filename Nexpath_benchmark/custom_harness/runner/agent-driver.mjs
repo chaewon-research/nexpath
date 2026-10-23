@@ -671,3 +671,20 @@ for (const row of rows) {
 }
 console.log(`${arm.toUpperCase()} SESSION COMPLETE (NOT SCORED): ${out}`);
 if (blockedTurns) console.log(`UserPromptSubmit blocked ${blockedTurns} frozen turn(s); no agent calls were made for those turns`);
+const finalMetaPath = join(out, 'meta.json');
+const finalMeta = JSON.parse(readFileSync(finalMetaPath, 'utf8'));
+const readLines = (name) => {
+  const file = join(out, name);
+  return existsSync(file) ? readFileSync(file, 'utf8').split('\\n').filter(Boolean).map(JSON.parse) : [];
+};
+const recordedSteps = [...readLines('agent-results.jsonl'), ...readLines('continuations.jsonl')];
+finalMeta.finished_at = new Date().toISOString();
+if (arm === 'nexpath' && !preprocessedNexpath) finalMeta.advisory_frequency = readLevel();
+finalMeta.audit_totals = {
+  popup_prepared: recordedSteps.filter((x) => x.popup_prepared === true).length,
+  popup_shown: recordedSteps.filter((x) => x.popup_shown === true).length,
+  cost_delta_usd: recordedSteps.reduce((sum, x) => sum + (x.cost_delta_usd ?? 0), 0),
+  cost_records: recordedSteps.filter((x) => x.cost_delta_usd !== null && x.cost_delta_usd !== undefined).length,
+};
+writeFileSync(finalMetaPath, JSON.stringify(finalMeta, null, 2) + '\\n');
+
