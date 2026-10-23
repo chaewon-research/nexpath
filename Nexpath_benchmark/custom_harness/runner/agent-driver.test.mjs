@@ -864,3 +864,45 @@ test('full benchmark input cannot reorder frozen prompts',()=>{
   assert.notEqual(r.status,0);
   assert.match(r.stderr,/inconsistent frozen handoff/);
 });
+
+
+test('turn 2 auto receives the existing Claude transcript from real HOME',()=>{
+  const f=fixtureNexpath();
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const cli=join(f.root,'mock-nexpath.cjs');writeMockNexpath(cli);
+  const realHome=join(f.root,'real-home');
+  const transcript=join(realHome,'.claude','projects','not-the-project-slug','mock-id.jsonl');
+  mkdirSync(dirname(transcript),{recursive:true});
+  writeFileSync(transcript,'{"type":"assistant","message":"turn 1"}\n');
+  const history=join(f.root,'history.jsonl');
+  const out=join(f.root,'outputs');
+  const r=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+cli,'--out='+out],
+    {MOCK_HISTORY:history,HOME:realHome});
+  assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
+  const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
+  const autos=calls.filter(c=>c.kind==='nexpath'&&c.hook==='auto');
+  assert.equal(autos.length,2);
+  assert.equal(autos[0].payload.transcript_path,undefined);
+  assert.equal(autos[1].payload.transcript_path,transcript);
+  assert.equal(existsSync(autos[1].payload.transcript_path),true);
+});
+
+test('continuation auto receives the same real Claude transcript',()=>{
+  const f=fixtureNexpath();
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const cli=join(f.root,'mock-nexpath.cjs');
+  const plan=join(f.root,'plan.json'),counter=join(f.root,'counter.txt');
+  writeMockNexpathStopPlan(cli,plan,counter);
+  writeFileSync(plan,JSON.stringify([{decision:'block',reason:'please add a test'},null,null]));
+  const realHome=join(f.root,'original-home');
+  const transcript=join(realHome,'.claude','projects','some-slug','mock-id.jsonl');
+  mkdirSync(dirname(transcript),{recursive:true});
+  writeFileSync(transcript,'{"type":"assistant","message":"after first prompt"}\n');
+  const history=join(f.root,'history.jsonl');
+  const r=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+cli,'--out='+join(f.root,'outputs')],
+    {MOCK_HISTORY:history,MOCK_STOP_PLAN:plan,MOCK_STOP_COUNTER:counter,HOME:realHome});
+  assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
+  const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
+  const autos=calls.filter(c=>c.kind==='nexpath'&&c.hook==='auto');
+  assert.deepEqual(autos.map(c=>c.payload.transcript_path),[undefined,transcript,transcript]);
+});
