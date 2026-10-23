@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Driver for the first two unconditional SWE-EVO turns (control or NexPath).
+// Agent driver for a complete, ordered frozen SWE-EVO conversation.
 // This pilot does not score the benchmark.
 // Control prompts go directly to Claude Code.
 // Standalone NexPath runs call UserPromptSubmit and Stop; processed runner
@@ -44,8 +44,8 @@ nexpath arm only (arm must be "nexpath" in the harness meta.json)
   --nexpath-timeout-seconds=<n> per hook call; default: 60
   --max-continuations=<n>     Stop-hook block decisions delivered per turn; default: 2
 
-Safety/scope: only turns 1-2, clean Git checkout. No shell tool for agent.
-This is a handoff pilot; it does not score SWE-EVO or check conditional turns.`);
+Safety/scope: full frozen prompt order, clean Git checkout, no shell tool for agent.
+Conditional turns are sent in order and are not used as scores.`);
   process.exit(0);
 }
 for (const name of ['turns', 'project']) {
@@ -90,7 +90,7 @@ if (!['control', 'nexpath'].includes(meta.arm)) fail('pilot requires meta.arm of
 const arm = meta.arm;
 if (fromRunner && arm !== 'nexpath') fail('--from-runner is only valid for a NexPath handoff');
 if (resolve(meta.project) !== project) fail('project differs from harness metadata');
-if (rows.length !== 2 || meta.limit !== 2) fail('pilot requires --limit=2 and exactly two turns');
+if (!rows.length) fail('frozen turn list is empty');
 for (const [i, row] of rows.entries()) {
   if (row.turn !== i + 1 || typeof row.raw_prompt !== 'string') {
     fail(`inconsistent frozen handoff at turn ${i + 1}`);
@@ -127,23 +127,29 @@ if (preprocessedNexpath) {
   }
 }
 
-// Cross-check against the frozen prompt file when it can be found, so a conditional
-// turn (one whose "check" depends on transcript/diff state) can never be smuggled in
-// as if it were turn 1 or 2. Best-effort: skipped for synthetic/offline task ids that
-// have no prompts/<task>.json, so existing pilot fixtures keep working unchanged.
+// A real benchmark run must contain every frozen prompt in order. The
+// synthetic-only fixtures without a prompt file retain their smaller test inputs.
 const frozenPath = join(HARNESS, 'prompts', `${meta.task}.json`);
+let frozenEntries = null;
 if (existsSync(frozenPath)) {
   let frozen;
-  try { frozen = JSON.parse(readFileSync(frozenPath, 'utf8')); } catch (e) { fail(`unreadable frozen prompt file: ${e.message}`); }
+  try { frozen = JSON.parse(readFileSync(frozenPath, 'utf8')); }
+  catch (e) { fail(`unreadable frozen prompt file: ${e.message}`); }
+  if (!Array.isArray(frozen.prompts) || frozen.prompts.length === 0) {
+    fail('frozen prompt file has no prompt list');
+  }
+  frozenEntries = frozen.prompts;
   for (const row of rows) {
-    const entry = Array.isArray(frozen.prompts) ? frozen.prompts.find((p) => p.n === row.turn) : null;
-    if (!entry) fail(`turn ${row.turn} has no matching entry in ${frozenPath}`);
-    if (entry.check !== 'always fits') {
-      fail(`turn ${row.turn} is a conditional turn ("check": ${JSON.stringify(entry.check)}); this pilot supports only the always-fits turns 1-2`);
+    const entry = frozenEntries[row.turn - 1];
+    if (!entry || entry.n !== row.turn) {
+      fail(`turn ${row.turn} has no matching entry in ${frozenPath}`);
     }
     if (entry.text !== row.raw_prompt) {
-      fail(`turn ${row.turn} prompt text does not match the frozen entry for task ${meta.task} (pilot only supports the frozen, always-fits turns 1-2)`);
+      fail(`turn ${row.turn} prompt text does not match the frozen entry for task ${meta.task}`);
     }
+  }
+  if (rows.length !== frozenEntries.length || (meta.limit != null && meta.limit !== frozenEntries.length)) {
+    fail(`full frozen session requires all ${frozenEntries.length} prompts in order; got ${rows.length} rows (limit=${meta.limit ?? 'none'})`);
   }
 }
 
@@ -159,7 +165,7 @@ const git = (...args) => {
 };
 const startingCommit = git('rev-parse', 'HEAD').trim();
 if (git('status', '--porcelain').trim()) fail('Git worktree must be clean before first turn');
-console.log(`Validated ${arm} turns [1, 2] at ${startingCommit.slice(0, 12)}; ${execute ? 'EXECUTE' : 'DRY RUN'}`);
+console.log(`Validated ${arm} turns [1..${rows.length}] at ${startingCommit.slice(0, 12)}; ${execute ? 'EXECUTE' : 'DRY RUN'}`);
 if (!execute) {
   for (const row of rows) console.log(`turn ${row.turn}: ${row.raw_prompt.length} characters`);
   console.log('DRY RUN PASS: no agent or NexPath launched; no output files written');
@@ -256,7 +262,8 @@ writeFileSync(join(out, 'meta.json'), JSON.stringify({
   proxy: proxyUrl || meta.proxy || null,
   proxy_mode: actualProxyMode || meta.proxy_mode || null,
   required_proxy_mode: requiredProxyMode || null,
-  mode: 'first_two_unconditional_turns_only',
+  mode: frozenEntries ? 'complete_frozen_session' : 'synthetic_fixture',
+  frozen_prompts: frozenEntries?.length ?? null,
   ...(arm === 'nexpath' ? {
     nexpath_cli: NEXPATH_CLI || meta.nexpath_cli || null,
     db: preprocessedNexpath ? (meta.db ?? null) : dbPath,
@@ -510,5 +517,5 @@ for (const row of rows) {
   rowResult.continuation_limit_reached = continuationLimitReached;
   appendFileSync(join(out, 'agent-results.jsonl'), JSON.stringify(rowResult) + '\n');
 }
-console.log(`${arm.toUpperCase()} PILOT COMPLETE (NOT SCORED): ${out}`);
+console.log(`${arm.toUpperCase()} SESSION COMPLETE (NOT SCORED): ${out}`);
 if (blockedTurns) console.log(`UserPromptSubmit blocked ${blockedTurns} frozen turn(s); no agent calls were made for those turns`);
