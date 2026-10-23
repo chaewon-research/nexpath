@@ -236,7 +236,7 @@ function autoPayload(prompt, activeSessionId) {
   const payload = { prompt, permission_mode: 'bypassPermissions' };
   if (activeSessionId) {
     const transcriptPath = transcriptForSession(activeSessionId);
-    if (!transcriptPath && agentBin === 'claude') {
+    if (!transcriptPath && /(^|[\\/])claude(?:\.cmd|\.exe)?$/.test(agentBin)) {
       fail('Claude Code transcript not found for session ' + activeSessionId);
     }
     if (transcriptPath) payload.transcript_path = transcriptPath;
