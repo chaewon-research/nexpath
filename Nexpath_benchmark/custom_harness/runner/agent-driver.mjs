@@ -13,6 +13,9 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HARNESS = resolve(HERE, '..');
+const PTY_RUN = join(HERE, 'pty-run.py');
+const PYTHON = process.env.HARNESS_PYTHON || 'python3';
+const POPUP_MARKER = 'Enter sends this prompt';
 
 const flags = Object.fromEntries(process.argv.slice(2).map((arg) => {
   const [name, ...pieces] = arg.replace(/^--/, '').split('=');
@@ -197,13 +200,15 @@ if (proxyUrl) nexpathEnv.OPENAI_BASE_URL = proxyUrl;
 
 function callNexpathHook(cmdArgs, stdinPayload, tag) {
   const startedAt = new Date().toISOString();
-  const res = spawnSync(process.execPath, [NEXPATH_CLI, ...cmdArgs], {
+  const res = spawnSync(PYTHON, [
+    PTY_RUN, '--marker=' + POPUP_MARKER, '--quiet-ms=2000',
+    '--timeout=' + nexpathTimeoutSeconds,
+    '--tty-log=' + join(out, tag + '-tty.log'),
+    '--', process.execPath, NEXPATH_CLI, ...cmdArgs,
+  ], {
     cwd: project, env: nexpathEnv, encoding: 'utf8',
-    input: JSON.stringify(stdinPayload), timeout: nexpathTimeoutSeconds * 1000,
+    input: JSON.stringify(stdinPayload), timeout: (nexpathTimeoutSeconds + 5) * 1000,
     maxBuffer: 16 * 1024 * 1024,
-    // Detach hook processes from the controlling terminal so NexPath's
-    // /dev/tty popup cannot take over the operator's terminal.
-    detached: true,
   });
   // spawnSync reports its timeout through res.error. External signals
   // can appear only in res.signal.
@@ -218,8 +223,14 @@ function callNexpathHook(cmdArgs, stdinPayload, tag) {
     fail(`nexpath ${cmdArgs[0]} (${tag}) was killed by signal ${res.signal} — likely exceeded `
       + `--nexpath-timeout-seconds=${nexpathTimeoutSeconds}; inspect ${tag}-stderr.log in ${out}`);
   }
+  if ((res.stderr || '').includes('pty-run: timeout')) {
+    fail('nexpath ' + cmdArgs[0] + ' (' + tag + ') timed out after ' + nexpathTimeoutSeconds + 's');
+  }
   if (res.status !== 0) {
-    fail(`nexpath ${cmdArgs[0]} (${tag}) exited with status ${res.status}; inspect ${tag}-stderr.log in ${out}`);
+    const signalMatch = (res.stderr || '').match(/pty-run: exit=(-\d+)/);
+    const signalName = signalMatch?.[1] === '-15' ? 'SIGTERM' : signalMatch?.[1] === '-9' ? 'SIGKILL' : null;
+    if (signalName) fail('nexpath ' + cmdArgs[0] + ' (' + tag + ') was killed by signal ' + signalName);
+    fail('nexpath ' + cmdArgs[0] + ' (' + tag + ') exited with status ' + res.status + '; see ' + tag + '-stderr.log');
   }
   return res;
 }
@@ -243,7 +254,8 @@ writeFileSync(join(out, 'meta.json'), JSON.stringify({
     // the real home directory for this run. keychain_sandboxed is always false: the OS keychain
     // layer is tied to the login session, not $HOME, and cannot be sandboxed from here — a run
     // on a machine with a keychain-stored key may still use it even under --no-key.
-    credential_isolation: { home_sandboxed: true, nexpath_home: nexpathHome, keychain_sandboxed: false },
+    credential_isolation: { home_sandboxed: !preprocessedNexpath, nexpath_home: preprocessedNexpath ? null : nexpathHome, keychain_sandboxed: false },
+    popup_input: preprocessedNexpath ? 'accepted by run-session' : 'private PTY auto-Enter',
   } : {}),
   started_at: new Date().toISOString(),
 }, null, 2) + '\n');
@@ -290,6 +302,20 @@ function writeStepArtifacts(tag, res) {
   return { cumulativeDiff, incrementalDiff };
 }
 
+// The accepted UserPromptSubmit popup sends its enhanced body on stdout.
+// With no popup, deliver the original prompt unchanged.
+function promptFromAuto(stdout, original) {
+  const line = String(stdout || '').split('\n').map((l) => l.trim()).filter(Boolean).reverse()
+    .find((l) => l.startsWith('{') && l.includes('hookSpecificOutput'));
+  if (!line) return original;
+  let payload;
+  try { payload = JSON.parse(line); } catch (e) { fail('malformed UserPromptSubmit JSON: ' + e.message); }
+  const enhanced = payload?.hookSpecificOutput?.additionalContext;
+  if (enhanced == null) return original;
+  if (typeof enhanced !== 'string' || !enhanced.trim()) fail('invalid UserPromptSubmit additionalContext');
+  return enhanced;
+}
+
 // Accepted Stop guidance has the shape {"decision":"block","reason":...}.
 // No decision line means no guidance; malformed decisions are reported.
 function parseStopDecision(stdout) {
@@ -308,14 +334,13 @@ let sessionId = null;
 for (const row of rows) {
   const prefix = `turn-${String(row.turn).padStart(2, '0')}`;
 
+  let submittedPrompt = preprocessedNexpath ? row.submit : row.raw_prompt;
   if (arm === 'nexpath' && !preprocessedNexpath) {
-    // UserPromptSubmit — before the agent ever sees this turn's prompt. Per the real
-    // hook contract, `auto` never rewrites the prompt; it only classifies/records.
-    callNexpathHook(['auto', '-p', project, '--db', dbPath],
-      { prompt: row.raw_prompt, permission_mode: 'bypassPermissions' }, `${prefix}-auto`);
+    // Standalone hook mode: the private PTY accepts the popup before Claude runs.
+    const autoResult = callNexpathHook(['auto', '-p', project, '--db', dbPath],
+      { prompt: row.raw_prompt, permission_mode: 'bypassPermissions' }, prefix + '-auto');
+    submittedPrompt = promptFromAuto(autoResult.stdout, row.raw_prompt);
   }
-
-  const submittedPrompt = preprocessedNexpath ? row.submit : row.raw_prompt;
   const { res, parsed, returnedSession } = runAgent(submittedPrompt, sessionId);
   const { cumulativeDiff, incrementalDiff } = writeStepArtifacts(prefix, res);
 
@@ -333,7 +358,7 @@ for (const row of rows) {
   const rowResult = {
     turn: row.turn, prompt_sha256: sha256(row.raw_prompt),
     submitted_prompt_sha256: sha256(submittedPrompt),
-    enhanced_used: preprocessedNexpath ? row.enhanced_used : false,
+    enhanced_used: preprocessedNexpath ? row.enhanced_used : submittedPrompt !== row.raw_prompt,
     exit_code: res.status, signal: res.signal, process_error: res.error?.message || null,
     is_error: parsed.is_error ?? null, subtype: parsed.subtype ?? null,
     session_id: returnedSession, num_turns: parsed.num_turns ?? null,
@@ -368,10 +393,10 @@ for (const row of rows) {
     // decision's continuation. In a real build NexPath's own echo guard (isInjectedPromptEcho,
     // src/decision-session/whydesc-delivery.ts) is what recognises this text came from its own
     // Stop hook and skips re-processing it as a fresh user prompt; offline tests mock that call.
-    callNexpathHook(['auto', '-p', project, '--db', dbPath],
-      { prompt: guidance, permission_mode: 'bypassPermissions' }, `${contPrefix}-auto`);
-
-    const contCall = runAgent(guidance, sessionId);
+    const autoContinuation = callNexpathHook(['auto', '-p', project, '--db', dbPath],
+      { prompt: guidance, permission_mode: 'bypassPermissions' }, contPrefix + '-auto');
+    const continuedPrompt = promptFromAuto(autoContinuation.stdout, guidance);
+    const contCall = runAgent(continuedPrompt, sessionId);
     const { cumulativeDiff: contCumulativeDiff, incrementalDiff: contIncrementalDiff } = writeStepArtifacts(contPrefix, contCall.res);
 
     // Stop fires with stop_hook_active:true — Claude is continuing BECAUSE of the previous
@@ -391,6 +416,7 @@ for (const row of rows) {
       turn: row.turn, step,
       original_prompt_sha256: sha256(row.raw_prompt),
       injected_guidance: guidance, injected_guidance_sha256: sha256(guidance),
+      submitted_guidance_sha256: sha256(continuedPrompt),
       session_id: contCall.returnedSession,
       exit_code: contCall.res.status, signal: contCall.res.signal,
       process_error: contCall.res.error?.message || null,
