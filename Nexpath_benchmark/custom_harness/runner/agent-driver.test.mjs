@@ -999,3 +999,23 @@ test('per-turn fits use actual transcript actions and reply evidence without sco
   assert.equal(meta.fits_summary.measured_as_score,false);
   assert.equal(meta.fits_summary.total,20);
 });
+
+test('continuation audit compares enhanced body with injected guidance, not frozen prompt',()=>{
+  const f=fixtureNexpath();
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const hook=join(f.root,'enhanced-continuation.cjs');
+  writeFileSync(hook,"#!/usr/bin/env node\nconst fs = require('fs');\nlet input='';\nprocess.stdin.on('data', d=>input+=d);\nprocess.stdin.on('end',()=>{\n  const args=process.argv.slice(2),hook=args[0],payload=JSON.parse(input);\n  fs.appendFileSync(process.env.MOCK_HISTORY,JSON.stringify({kind:'nexpath',hook,prompt:payload.prompt||null})+'\\n');\n  if(hook==='stop'){\n    const counter=process.env.MOCK_STOP_COUNTER;\n    const count=fs.existsSync(counter)?Number(fs.readFileSync(counter,'utf8')):0;\n    fs.writeFileSync(counter,String(count+1));\n    if(count===0)console.log(JSON.stringify({decision:'block',reason:'please add a regression test'}));\n  }else if(hook==='auto' && payload.prompt==='please add a regression test'){\n    console.log(JSON.stringify({hookSpecificOutput:{hookEventName:'UserPromptSubmit',additionalContext:'please add a regression test\\n\\nNexPath: check it'}}));\n  }\n});"+'\n');
+  chmodSync(hook,0o755);
+  const history=join(f.root,'history.jsonl'),out=join(f.root,'outputs');
+  const r=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+hook,'--out='+out],
+    {MOCK_HISTORY:history,MOCK_STOP_COUNTER:join(f.root,'stop-counter.txt')});
+  assert.equal(r.status,0,r.stderr+'\\n'+r.stdout);
+  const calls=readFileSync(history,'utf8').trim().split('\\n').map(JSON.parse);
+  assert.deepEqual(calls.filter(x=>x.kind==='agent').map(x=>x.prompt),
+    ['prompt 1','please add a regression test\\n\\nNexPath: check it','prompt 2']);
+  const cont=readFileSync(join(out,'continuations.jsonl'),'utf8').trim().split('\\n').map(JSON.parse);
+  assert.equal(cont.length,1);
+  assert.equal(cont[0].enhanced_used,true);
+  assert.equal(cont[0].keeps_original_verbatim,true);
+  assert.notEqual(cont[0].submitted_guidance_sha256,cont[0].injected_guidance_sha256);
+});
