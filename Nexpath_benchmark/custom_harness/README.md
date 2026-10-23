@@ -108,9 +108,14 @@ node runner/agent-driver.mjs --turns=runs/<run-id>/turns.jsonl --project=<checko
 ```
 
 It validates every prompt against the corresponding frozen entry in
-`prompts/<task>.json` without skipping conditional turns. The post-run
-`fits` evidence assessment and expanded per-turn audit fields are not yet
-implemented. See `--help` for every flag.
+`prompts/<task>.json` without skipping conditional turns. After the session,
+`fits.jsonl` records a `fits: true|false` check for every frozen `assumes` line,
+using prior transcript tool actions, agent replies and cumulative pre-turn Git
+patches. The same fields are added to `agent-results.jsonl`, and `meta.json`
+reports counts per arm. These evidence checks are conservative, especially for
+subjective reply assumptions: missing evidence is marked `false`, not guessed.
+They are reported for auditing, **never** counted as SWE-EVO scores.
+See `--help` for every flag.
 
 Then grade the popups it produced:
 
