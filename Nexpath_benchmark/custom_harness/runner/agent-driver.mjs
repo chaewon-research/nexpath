@@ -85,17 +85,23 @@ for (const [i, row] of rows.entries()) {
   }
 }
 
-// Do not invoke NexPath twice on the same prompts. NexPath-arm output from
-// run-session.mjs already includes hook results; use a plain {turn, raw_prompt}
-// handoff for this driver.
-if (arm === 'nexpath') {
-  const RUN_SESSION_HOOK_OUTCOME_KEYS = ['enhanced_prompt', 'fired_flag', 'pe_status', 'pe_sections', 'keeps_original_verbatim'];
+// A harness-generated NexPath row already contains its accepted prompt in 'submit'.
+// Consuming it must not trigger the same hooks a second time.
+const hookFields = ['enhanced_prompt', 'fired_flag', 'pe_status', 'pe_sections', 'keeps_original_verbatim'];
+const hasHookFields = (row) => hookFields.some((field) => Object.hasOwn(row, field));
+const preprocessedNexpath = arm === 'nexpath' && rows.some(hasHookFields);
+if (preprocessedNexpath) {
   for (const [i, row] of rows.entries()) {
-    const present = RUN_SESSION_HOOK_OUTCOME_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(row, k));
-    if (present.length) {
-      fail(`turn ${i + 1} already carries NexPath hook-outcome fields (${present.join(', ')}) from run-session.mjs; `
-        + `running this driver's nexpath arm on it would invoke NexPath a second time on the same prompts. `
-        + `Use run-session.mjs's control-arm output, or a plain {turn, raw_prompt} handoff, for the live agent pilot.`);
+    if (!hookFields.every((field) => Object.hasOwn(row, field))) {
+      fail('turn ' + (i + 1) + ' has incomplete NexPath hook outcome fields');
+    }
+    if (typeof row.submit !== 'string' || !row.submit.trim()
+      || typeof row.enhanced_used !== 'boolean'
+      || (row.enhanced_prompt !== null && typeof row.enhanced_prompt !== 'string')
+      || row.submit !== (row.enhanced_prompt ?? row.raw_prompt)
+      || row.enhanced_used !== Boolean(row.enhanced_prompt)
+      || row.keeps_original_verbatim === false) {
+      fail('turn ' + (i + 1) + ' has inconsistent accepted NexPath handoff');
     }
   }
 }
@@ -120,7 +126,7 @@ if (existsSync(frozenPath)) {
   }
 }
 
-if (arm === 'nexpath') {
+if (arm === 'nexpath' && !preprocessedNexpath) {
   if (!NEXPATH_CLI) fail('nexpath arm requires --nexpath-cli=<path> (or NEXPATH_CLI env var)');
   if (!existsSync(NEXPATH_CLI)) fail(`NexPath CLI not found at ${NEXPATH_CLI}`);
 }
@@ -161,7 +167,7 @@ const { key, from: keyFrom } = noKey ? { key: undefined, from: 'withheld (--no-k
 // Set a fresh HOME to isolate ~/.nexpath/config.json for hook subprocesses.
 // OS-keychain access is not isolated, so --no-key is not a full credential sandbox.
 const nexpathHome = join(out, 'nexpath-home');
-if (arm === 'nexpath') mkdirSync(nexpathHome, { recursive: true }); // control arm never spawns nexpath; nothing to sandbox
+if (arm === 'nexpath' && !preprocessedNexpath) mkdirSync(nexpathHome, { recursive: true }); // control arm never spawns nexpath; nothing to sandbox
 const nexpathEnv = { ...process.env, HOME: nexpathHome };
 if (key) nexpathEnv.OPENAI_API_KEY = key; else delete nexpathEnv.OPENAI_API_KEY;
 
@@ -201,7 +207,9 @@ writeFileSync(join(out, 'meta.json'), JSON.stringify({
   source: turnsFile, source_sha256: sha256(readFileSync(turnsFile)),
   mode: 'first_two_unconditional_turns_only',
   ...(arm === 'nexpath' ? {
-    nexpath_cli: NEXPATH_CLI, db: dbPath,
+    nexpath_cli: NEXPATH_CLI || meta.nexpath_cli || null,
+    db: preprocessedNexpath ? (meta.db ?? null) : dbPath,
+    hook_source: preprocessedNexpath ? 'run-session' : 'agent-driver',
     key_source: keyFrom === 'missing' ? 'none' : keyFrom,   // never the key itself
     nexpath_timeout_seconds: nexpathTimeoutSeconds,
     // home_sandboxed: the file-fallback credential layer (~/.nexpath/config.json) cannot reach
@@ -273,18 +281,19 @@ let sessionId = null;
 for (const row of rows) {
   const prefix = `turn-${String(row.turn).padStart(2, '0')}`;
 
-  if (arm === 'nexpath') {
+  if (arm === 'nexpath' && !preprocessedNexpath) {
     // UserPromptSubmit — before the agent ever sees this turn's prompt. Per the real
     // hook contract, `auto` never rewrites the prompt; it only classifies/records.
     callNexpathHook(['auto', '-p', project, '--db', dbPath],
       { prompt: row.raw_prompt, permission_mode: 'bypassPermissions' }, `${prefix}-auto`);
   }
 
-  const { res, parsed, returnedSession } = runAgent(row.raw_prompt, sessionId);
+  const submittedPrompt = preprocessedNexpath ? row.submit : row.raw_prompt;
+  const { res, parsed, returnedSession } = runAgent(submittedPrompt, sessionId);
   const { cumulativeDiff, incrementalDiff } = writeStepArtifacts(prefix, res);
 
   let stopDecision = { kind: 'none' };
-  if (arm === 'nexpath') {
+  if (arm === 'nexpath' && !preprocessedNexpath) {
     // Stop — only once this agent turn has actually completed (success or failure).
     const stopRes = callNexpathHook(['stop', '--db', dbPath], {
       cwd: project, hook_event_name: 'Stop', stop_hook_active: false,
@@ -296,6 +305,8 @@ for (const row of rows) {
 
   const rowResult = {
     turn: row.turn, prompt_sha256: sha256(row.raw_prompt),
+    submitted_prompt_sha256: sha256(submittedPrompt),
+    enhanced_used: preprocessedNexpath ? row.enhanced_used : false,
     exit_code: res.status, signal: res.signal, process_error: res.error?.message || null,
     is_error: parsed.is_error ?? null, subtype: parsed.subtype ?? null,
     session_id: returnedSession, num_turns: parsed.num_turns ?? null,
@@ -318,7 +329,7 @@ for (const row of rows) {
   let step = 0;
   let pendingDecision = stopDecision;
   let continuationLimitReached = false;
-  while (arm === 'nexpath' && pendingDecision.kind === 'accepted') {
+  while (arm === 'nexpath' && !preprocessedNexpath && pendingDecision.kind === 'accepted') {
     if (step >= maxContinuations) { continuationLimitReached = true; break; }
     step += 1;
     const contPrefix = `${prefix}-cont-${String(step).padStart(2, '0')}`;
