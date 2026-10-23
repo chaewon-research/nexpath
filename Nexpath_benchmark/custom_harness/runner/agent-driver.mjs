@@ -675,7 +675,7 @@ const finalMetaPath = join(out, 'meta.json');
 const finalMeta = JSON.parse(readFileSync(finalMetaPath, 'utf8'));
 const readLines = (name) => {
   const file = join(out, name);
-  return existsSync(file) ? readFileSync(file, 'utf8').split('\\n').filter(Boolean).map(JSON.parse) : [];
+  return existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map(JSON.parse) : [];
 };
 const recordedSteps = [...readLines('agent-results.jsonl'), ...readLines('continuations.jsonl')];
 finalMeta.finished_at = new Date().toISOString();
@@ -686,5 +686,5 @@ finalMeta.audit_totals = {
   cost_delta_usd: recordedSteps.reduce((sum, x) => sum + (x.cost_delta_usd ?? 0), 0),
   cost_records: recordedSteps.filter((x) => x.cost_delta_usd !== null && x.cost_delta_usd !== undefined).length,
 };
-writeFileSync(finalMetaPath, JSON.stringify(finalMeta, null, 2) + '\\n');
+writeFileSync(finalMetaPath, JSON.stringify(finalMeta, null, 2) + '\n');
 
