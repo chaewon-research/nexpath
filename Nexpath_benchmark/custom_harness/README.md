@@ -47,12 +47,14 @@ all. It supports both arms:
 
 - `arm: control`: each prompt goes straight to the agent; NexPath is never invoked,
   even if `--nexpath-cli` is given.
-- `arm: nexpath`: for NexPath runs produced by `run-session.mjs`, delivers the
-  already-accepted `submit` value to the coding agent and does **not** run the
-  same hooks twice. For plain-prompt standalone runs, wraps `nexpath auto` and
-  `nexpath stop` around each agent turn. The hooks run inside a private PTY
-  with `runner/pty-run.py` so an accepted popup's `additionalContext`
-  reaches the agent. Standalone runs get a fresh run-local `session.db`.
+- `arm: nexpath`: the measured arm is the standalone hook path. The driver
+  calls `nexpath auto` before each agent turn and `nexpath stop` afterward,
+  using a private PTY from `runner/pty-run.py`. Accepted `additionalContext`
+  reaches the agent, while an explicit UserPromptSubmit block sends nothing.
+  Each standalone run gets a fresh run-local `session.db`.
+  `--from-runner` accepts preprocessed NexPath rows from `run-session.mjs`
+  without repeating hooks, but marks the output `arm_definition: "fixture"`.
+  Fixture runs must not be interpreted as measured NexPath-arm results.
 
   When `stop` accepts guidance (the real hook contract: stdout
   `{"decision":"block","reason":...}` on a clean exit), it is delivered to the same
@@ -64,8 +66,8 @@ all. It supports both arms:
   the cap is logged and recorded. Each continuation's prompt, guidance,
   session id, hook outcome, agent result and patch are recorded in their own row in
   `continuations.jsonl`, separate from the turn's own row in `agent-results.jsonl`.
-  Processed NexPath handoffs are accepted only when their existing hook-outcome
-  fields and enhanced `submit` values are consistent. Hooks are not re-invoked.
+  Processed NexPath handoffs require `--from-runner` and consistent hook-outcome
+  fields and accepted `submit` values. The driver does not re-invoke their hooks.
 
   Hook calls check exit status and timeouts. A failed NexPath hook fails the
   NexPath-arm run instead of appearing as a successful no-guidance turn.
@@ -73,7 +75,9 @@ all. It supports both arms:
 
   Each step records a cumulative patch from the starting commit and an
   incremental patch for that step. Staging changes before generating the
-  patches ensures that new, previously untracked files are included.
+  patches includes untracked files. The index is reset after capture, leaving
+  file changes in the working tree. Reuse a clean checkout for another run;
+  do not discard experimental changes without checking them.
 
 ### Known limitations
 
@@ -90,6 +94,7 @@ all. It supports both arms:
 ```bash
 node runner/agent-driver.mjs --turns=runs/<run-id>/turns.jsonl --project=<checkout> \
   --execute --nexpath-cli=/path/to/nexpath/dist/cli/index.js
+# For fixture-only handoff of run-session NexPath rows, add --from-runner.
 # For repeatable live hook calls, pass --proxy-url=... --require-proxy-mode=replay
 ```
 
