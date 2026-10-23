@@ -732,10 +732,10 @@ for (const row of rows) {
     const contAutoBlock = blockFromAuto(autoContinuation.stdout);
     if (contAutoBlock) {
       appendFileSync(join(out, 'continuations.jsonl'), JSON.stringify({
-        ...eventFields(row, null),
+        ...eventFields({ ...row, raw_prompt: guidance }, null),
         turn: row.turn, step, original_prompt_sha256: sha256(row.raw_prompt),
         injected_guidance_sha256: sha256(guidance),
-        submitted_guidance_sha256: null, auto_blocked: true,
+        submitted_guidance_sha256: null, enhanced_used: false, auto_blocked: true,
         block_reason: contAutoBlock.reason, agent_invoked: false,
         session_id: sessionId, hook_outcome: 'auto_blocked',
         patch_file: null, incremental_patch_file: null,
@@ -762,11 +762,12 @@ for (const row of rows) {
     // the session id, the hook outcome, and the agent's execution result each get their own
     // field here, and the patch for this step is its own file (never folded into the turn's).
     appendFileSync(join(out, 'continuations.jsonl'), JSON.stringify({
-      ...eventFields(row, continuedPrompt),
+      ...eventFields({ ...row, raw_prompt: guidance }, continuedPrompt),
       turn: row.turn, step,
       original_prompt_sha256: sha256(row.raw_prompt),
       injected_guidance: guidance, injected_guidance_sha256: sha256(guidance),
       submitted_guidance_sha256: sha256(continuedPrompt),
+      enhanced_used: continuedPrompt !== guidance,
       auto_blocked: false, agent_invoked: true,
       ...agentMetrics(contCall.parsed),
       session_id: contCall.returnedSession,
