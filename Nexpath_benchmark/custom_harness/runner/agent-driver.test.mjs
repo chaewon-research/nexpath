@@ -940,3 +940,24 @@ test('cumulative Claude cost is converted to per-call cost without double counti
   assert.equal(records[1].usage.cache_creation_input_tokens,2);
   assert.equal(records[0].duration_ms,950);
 });
+
+test('audit fields distinguish prepared and shown popup and count DB sections',()=>{
+  const f=fixtureNexpath();
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const cli=join(f.root,'db-evidence-hook.cjs');
+  writeFileSync(cli, "#!/usr/bin/env node\nconst {DatabaseSync}=require('node:sqlite');\nlet input='';process.stdin.on('data',d=>input+=d);\nprocess.stdin.on('end',()=>{\n  const args=process.argv.slice(2),hook=args[0],dbPath=args[args.indexOf('--db')+1];\n  const payload=JSON.parse(input);\n  const db=new DatabaseSync(dbPath);\n  db.exec(\"CREATE TABLE IF NOT EXISTS pending_prompt_enhancements(id INTEGER PRIMARY KEY AUTOINCREMENT,status TEXT NOT NULL,result_json TEXT NOT NULL);\");\n  db.exec(\"CREATE TABLE IF NOT EXISTS pending_advisories(id INTEGER PRIMARY KEY AUTOINCREMENT,flag_type TEXT NOT NULL);\");\n  if(hook==='auto'&&payload.prompt==='prompt 1'){\n    db.prepare('INSERT INTO pending_prompt_enhancements(status,result_json) VALUES(?,?)').run('pending',JSON.stringify({currentBody:{sections:[{title:'one'},{title:'two'}]}}));\n    db.prepare('INSERT INTO pending_advisories(flag_type) VALUES(?)').run('stage_transition');\n  }else if(hook==='stop'){\n    db.prepare(\"UPDATE pending_prompt_enhancements SET status='shown' WHERE status='pending'\").run();\n  }\n  db.close();\n});\n");
+  chmodSync(cli,0o755);
+  const out=join(f.root,'outputs');
+  const r=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+cli,'--out='+out],{MOCK_HISTORY:join(f.root,'history.jsonl')});
+  assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
+  const rows=readFileSync(join(out,'agent-results.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(rows.length,2);
+  assert.equal(rows[0].popup_prepared,true);
+  assert.equal(rows[0].popup_shown,true);
+  assert.equal(rows[0].pe_status,'shown');
+  assert.equal(rows[0].pe_sections,2);
+  assert.equal(rows[0].fired_flag,'stage_transition');
+  assert.equal(rows[1].popup_prepared,false);
+  assert.equal(rows[1].popup_shown,false);
+  assert.equal(rows[1].fired_flag,null);
+});
