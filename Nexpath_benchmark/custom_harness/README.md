@@ -70,6 +70,11 @@ rejected. It supports both arms:
   the cap is logged and recorded. Each continuation's prompt, guidance,
   session id, hook outcome, agent result and patch are recorded in their own row in
   `continuations.jsonl`, separate from the turn's own row in `agent-results.jsonl`.
+  Agent rows include raw cumulative Claude cost, per-call cost deltas, usage and
+  duration. The standalone run DB records `advisory_frequency`, selected by
+  `--level=optimum` (default) or `--level=every_event`, and provides separate
+  popup-prepared and popup-shown fields, fired flags, and section counts.
+  The run metadata records source versions and the empty Claude setting sources.
   Processed NexPath handoffs require `--from-runner` and consistent hook-outcome
   fields and accepted `submit` values. The driver does not re-invoke their hooks.
 
