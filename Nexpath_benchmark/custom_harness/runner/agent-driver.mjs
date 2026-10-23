@@ -33,6 +33,7 @@ Default: validate inputs and print a DRY RUN summary (no model calls).
   --max-turns=<n>             per agent response; default: 8
   --timeout-seconds=<n>       per agent response; default: 300
   --agent-bin=<path>          default: claude (replace only for offline tests)
+  --from-runner               fixture-only input; not a measured NexPath arm
   --proxy-url=<url>           NexPath record/replay proxy
   --require-proxy-mode=<m>   verify proxy mode before the run
 
@@ -55,6 +56,8 @@ const turnsFile = resolve(flags.turns);
 const project = resolve(flags.project);
 const out = resolve(flags.out || join(dirname(turnsFile), 'agent-driver'));
 const execute = flags.execute === true;
+if (flags['from-runner'] && flags['from-runner'] !== true) fail('--from-runner must not have a value');
+const fromRunner = flags['from-runner'] === true;
 const model = String(flags.model || 'claude-sonnet-5');
 const maxTurns = Number(flags['max-turns'] || 8);
 const timeoutSeconds = Number(flags['timeout-seconds'] || 300);
@@ -85,6 +88,7 @@ try {
 if (meta.schema !== 'custom_harness.run.v1') fail('pilot requires custom_harness.run.v1 harness metadata');
 if (!['control', 'nexpath'].includes(meta.arm)) fail('pilot requires meta.arm of "control" or "nexpath"');
 const arm = meta.arm;
+if (fromRunner && arm !== 'nexpath') fail('--from-runner is only valid for a NexPath handoff');
 if (resolve(meta.project) !== project) fail('project differs from harness metadata');
 if (rows.length !== 2 || meta.limit !== 2) fail('pilot requires --limit=2 and exactly two turns');
 for (const [i, row] of rows.entries()) {
@@ -100,7 +104,13 @@ for (const [i, row] of rows.entries()) {
 // Consuming it must not trigger the same hooks a second time.
 const hookFields = ['enhanced_prompt', 'fired_flag', 'pe_status', 'pe_sections', 'keeps_original_verbatim'];
 const hasHookFields = (row) => hookFields.some((field) => Object.hasOwn(row, field));
-const preprocessedNexpath = arm === 'nexpath' && rows.some(hasHookFields);
+const preprocessedNexpath = arm === 'nexpath' && fromRunner;
+if (arm === 'nexpath' && !fromRunner && rows.some(hasHookFields)) {
+  fail('processed NexPath handoff requires --from-runner (fixture only)');
+}
+if (fromRunner && !rows.every(hasHookFields)) {
+  fail('--from-runner requires processed NexPath rows with hook-outcome fields');
+}
 if (preprocessedNexpath) {
   for (const [i, row] of rows.entries()) {
     if (!hookFields.every((field) => Object.hasOwn(row, field))) {
@@ -238,7 +248,9 @@ function callNexpathHook(cmdArgs, stdinPayload, tag) {
 
 writeFileSync(join(out, 'meta.json'), JSON.stringify({
   schema: arm === 'control' ? 'agent_driver.control_pilot.v1' : 'agent_driver.nexpath_pilot.v1',
-  task: meta.task, arm, starting_commit: startingCommit,
+  task: meta.task, arm,
+  arm_definition: fromRunner ? 'fixture' : arm === 'nexpath' ? 'standalone' : 'control',
+  starting_commit: startingCommit,
   model, max_turns: maxTurns, timeout_seconds: timeoutSeconds,
   source: turnsFile, source_sha256: sha256(readFileSync(turnsFile)),
   proxy: proxyUrl || meta.proxy || null,
@@ -299,6 +311,9 @@ function writeStepArtifacts(tag, res) {
   writeFileSync(join(out, `${tag}.patch`), cumulativeDiff);
   writeFileSync(join(out, `${tag}-incremental.patch`), incrementalDiff);
   writeFileSync(join(out, `${tag}-git-status.txt`), git('status', '--short'));
+  // Preserve the on-disk edits while returning Git's index to its original state.
+  // The checkout may still be dirty and must be reset separately before reuse.
+  git('reset', '--mixed', '--quiet', startingCommit);
   previousTreeSha = treeSha;
   return { cumulativeDiff, incrementalDiff };
 }
