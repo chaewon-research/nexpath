@@ -514,7 +514,7 @@ console.log(JSON.stringify({ session_id: 'mock-id', is_error: false, subtype: 's
   chmodSync(path, 0o755);
 }
 
-test('nexpath hook calls run detached from any controlling terminal, never the one the driver was launched from', { skip: !PS_AVAILABLE }, () => {
+test('nexpath hooks get private terminal sessions, separate from the operator terminal', { skip: !PS_AVAILABLE }, () => {
   const f = fixtureNexpath();
   const mockAgent = join(f.root, 'mock-agent.cjs'); writeMockAgent(mockAgent);
   const mockNexpath = join(f.root, 'mock-nexpath-sid.cjs'); writeMockNexpathSidProbe(mockNexpath);
@@ -526,7 +526,7 @@ test('nexpath hook calls run detached from any controlling terminal, never the o
   assert.equal(calls.length, 4); // auto,stop per turn x2 turns, no continuation (mock emits no decision)
   for (const c of calls) {
     assert.notEqual(c.sid, ownSid, `${c.hook} call shares this test's session -- its /dev/tty popup probe could attach to our terminal`);
-    assert.equal(c.sid, String(c.pid), `${c.hook} call is not its own session leader -- detached:true did not take effect`);
+    assert.equal(c.sid, String(c.pid), `${c.hook} did not receive its own PTY session`);
   }
 });
 
@@ -549,10 +549,8 @@ test('a nexpath hook killed by the --nexpath-timeout-seconds timeout fails the r
   const history = join(f.root, 'history.jsonl');
   const r = invoke(f, ['--execute', `--agent-bin=${mockAgent}`, `--nexpath-cli=${mockNexpath}`, `--out=${join(f.root, 'outputs')}`, '--nexpath-timeout-seconds=1'], { MOCK_HISTORY: history });
   assert.notEqual(r.status, 0);
-  // On current Node, spawnSync's own timeout kill surfaces as `res.error` (ETIMEDOUT) and is
-  // caught by the pre-existing spawn-failure check -- confirmed here so a regression in that
-  // assumption (e.g. a Node/platform where it does not) would be caught by the NEXT test below.
-  assert.match(r.stderr, /nexpath auto .*failed to spawn.*ETIMEDOUT/);
+  // The PTY wrapper reports child timeout; the outer spawn has a cleanup buffer.
+  assert.match(r.stderr, /nexpath auto .*timed out after|nexpath auto .*failed to spawn.*ETIMEDOUT/);
   assert.equal(existsSync(join(f.root, 'outputs', 'continuations.jsonl')), false);
 });
 
@@ -716,4 +714,37 @@ test('proxy replay mode is verified and carried to NexPath hooks',async()=>{
   } finally {
     server.kill();
   }
+});
+
+test('standalone UserPromptSubmit popup uses private PTY and forwards accepted context',()=>{
+  const f=fixtureNexpath();
+  const agent=join(f.root,'mock-agent.cjs'); writeMockAgent(agent);
+  const cli=join(f.root,'mock-popup.cjs');
+  writeFileSync(cli, `#!/usr/bin/env node
+const fs = require('fs');
+let input = '';
+process.stdin.on('data', d => input += d);
+process.stdin.on('end', () => {
+  const payload=JSON.parse(input);
+  fs.appendFileSync(process.env.MOCK_HISTORY,JSON.stringify({kind:'nexpath',hook:process.argv[2]})+'\\n');
+  if(process.argv[2]==='auto' && payload.prompt==='prompt 1'){
+    const tty=fs.openSync('/dev/tty','r+');
+    fs.writeSync(tty,'Enter sends this prompt\\n');
+    fs.readSync(tty,Buffer.alloc(64),0,64,null);
+    fs.closeSync(tty);
+    console.log(JSON.stringify({hookSpecificOutput:{hookEventName:'UserPromptSubmit',additionalContext:'prompt 1\\nNexPath guidance: check release notes'}}));
+  }
+});
+`);
+  chmodSync(cli,0o755);
+  const history=join(f.root,'history.jsonl'), out=join(f.root,'outputs');
+  const r=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+cli,'--out='+out],{MOCK_HISTORY:history});
+  assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
+  const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(calls.filter(c=>c.kind==='agent').map(c=>c.prompt),['prompt 1\nNexPath guidance: check release notes','prompt 2']);
+  const results=readFileSync(join(out,'agent-results.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(results[0].enhanced_used,true);
+  assert.notEqual(results[0].submitted_prompt_sha256,results[0].prompt_sha256);
+  assert.equal(results[1].enhanced_used,false);
+  assert.match(readFileSync(join(out,'turn-01-auto-tty.log'),'utf8'),/Enter sends this prompt/);
 });
