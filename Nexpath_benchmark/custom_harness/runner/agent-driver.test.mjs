@@ -906,3 +906,37 @@ test('continuation auto receives the same real Claude transcript',()=>{
   const autos=calls.filter(c=>c.kind==='nexpath'&&c.hook==='auto');
   assert.deepEqual(autos.map(c=>c.payload.transcript_path),[undefined,transcript,transcript]);
 });
+
+
+test('standalone level is set on fresh DB before the first hook',()=>{
+  const f=fixtureNexpath();
+  const mockAgent=join(f.root,'agent.cjs');writeMockAgent(mockAgent);
+  const cli=join(f.root,'config-checking-hook.cjs');
+  writeFileSync(cli, "#!/usr/bin/env node\nconst fs=require('fs');const {DatabaseSync}=require('node:sqlite');let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{const args=process.argv.slice(2);const dbPath=args[args.indexOf('--db')+1];const db=new DatabaseSync(dbPath,{readOnly:true});const row=db.prepare(\"SELECT value FROM config WHERE key='advisory_frequency'\").get();db.close();fs.appendFileSync(process.env.MOCK_HISTORY,JSON.stringify({kind:'nexpath',hook:args[0],level:row.value})+'\\n');});\n");
+  chmodSync(cli,0o755);
+  const history=join(f.root,'history.jsonl'),out=join(f.root,'outputs');
+  const run=invoke(f,['--execute','--level=every_event','--agent-bin='+mockAgent,'--nexpath-cli='+cli,'--out='+out],{MOCK_HISTORY:history});
+  assert.equal(run.status,0,run.stderr+'\n'+run.stdout);
+  const hooks=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse).filter(x=>x.kind==='nexpath');
+  assert.equal(hooks.length,4);
+  assert.ok(hooks.every(x=>x.level==='every_event'));
+  const metadata=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
+  assert.equal(metadata.level,'every_event');
+  assert.equal(metadata.advisory_frequency,'every_event');
+  assert.deepEqual(metadata.setting_sources_argv,['--setting-sources','']);
+});
+
+test('cumulative Claude cost is converted to per-call cost without double counting',()=>{
+  const f=fixture();const agent=join(f.root,'cost-agent.cjs');
+  writeFileSync(agent,"#!/usr/bin/env node\nconst fs=require('fs');const file=process.env.MOCK_COUNTER;const i=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8')):0;fs.writeFileSync(file,String(i+1));const cost=i===0?0.1615:0.1901;console.log(JSON.stringify({session_id:'cost-id',is_error:false,subtype:'success',num_turns:1,total_cost_usd:cost,usage:{input_tokens:12,output_tokens:7,cache_read_input_tokens:3,cache_creation_input_tokens:2},duration_ms:950}));\n");
+  chmodSync(agent,0o755);
+  const out=join(f.root,'outputs');
+  const run=invoke(f,['--execute','--agent-bin='+agent,'--out='+out],{MOCK_COUNTER:join(f.root,'counter')});
+  assert.equal(run.status,0,run.stderr+'\n'+run.stdout);
+  const records=readFileSync(join(out,'agent-results.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(records.map(x=>x.total_cost_usd),[0.1615,0.1901]);
+  assert.ok(Math.abs(records[0].cost_delta_usd-0.1615)<1e-9);
+  assert.ok(Math.abs(records[1].cost_delta_usd-0.0286)<1e-9);
+  assert.equal(records[1].usage.cache_creation_input_tokens,2);
+  assert.equal(records[0].duration_ms,950);
+});
