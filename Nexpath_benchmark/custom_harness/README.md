@@ -47,11 +47,12 @@ all. It supports both arms:
 
 - `arm: control` — each prompt goes straight to the agent; NexPath is never invoked,
   even if `--nexpath-cli` is given.
-- `arm: nexpath` — `nexpath auto` (UserPromptSubmit) runs before the agent sees the
-  prompt, `nexpath stop` (Stop) runs only once that agent turn has completed, and the
-  run gets its own fresh `session.db` under its output dir — never `~/.nexpath`, and
-  never the user's Claude Code settings (NexPath is invoked as a plain subprocess, not
-  through `nexpath install`).
+- `arm: nexpath` — for NexPath runs produced by `run-session.mjs`, delivers the
+  already-accepted `submit` value to the coding agent and does **not** run the
+  same hooks twice. For plain-prompt standalone runs, wraps `nexpath auto` and
+  `nexpath stop` around each agent turn. The hooks run inside a private PTY
+  with `runner/pty-run.py` so an accepted popup's `additionalContext`
+  reaches the agent. Standalone runs get a fresh run-local `session.db`.
 
   When `stop` accepts guidance (the real hook contract: stdout
   `{"decision":"block","reason":...}` on a clean exit), it is delivered to the same
@@ -63,13 +64,12 @@ all. It supports both arms:
   the cap is logged and recorded, not hidden. Each continuation's prompt, guidance,
   session id, hook outcome, agent result and patch are recorded in their own row in
   `continuations.jsonl`, separate from the turn's own row in `agent-results.jsonl`.
-  A `turns.jsonl` that already carries NexPath's own hook-outcome fields (i.e. one
-  `run-session.mjs` already ran through its nexpath arm) is rejected outright, so the
-  live driver can never apply NexPath's hooks a second time over the same prompts.
+  Processed NexPath handoffs are accepted only when their existing hook-outcome
+  fields and enhanced `submit` values are consistent. Hooks are not re-invoked.
 
   Hook calls check exit status and timeouts. A failed NexPath hook fails the
   NexPath-arm run instead of appearing as a successful no-guidance turn.
-  Hooks are detached to keep popups off the operator's terminal.
+  Hooks use their own pseudo-terminal, not the operator's terminal.
 
   Each step records a cumulative patch from the starting commit and an
   incremental patch for that step. Staging changes before generating the
@@ -83,14 +83,14 @@ all. It supports both arms:
   guarantee a credential-free run on a machine with a stored key.
   `meta.json` records `keychain_sandboxed: false`. Complete isolation
   requires a separate environment or a change to NexPath's credential resolver.
-- **Live popup delivery is unverified.** Detached hook processes cannot
-  show interactive `/dev/tty` popups in the operator's terminal. The live
-  guidance/continuation path has not been tested end to end; offline tests
-  exercise it with a mocked CLI.
+- **End-to-end live guidance remains unverified.** Offline tests exercise the
+  private PTY and enhanced-prompt forwarding with mock processes, but no live
+  Claude Code coding-agent benchmark with real NexPath guidance is established.
 
 ```bash
 node runner/agent-driver.mjs --turns=runs/<run-id>/turns.jsonl --project=<checkout> \
   --execute --nexpath-cli=/path/to/nexpath/dist/cli/index.js
+# For repeatable live hook calls, pass --proxy-url=... --require-proxy-mode=replay
 ```
 
 It validates turns 1-2 only and explicitly rejects anything that doesn't match the
