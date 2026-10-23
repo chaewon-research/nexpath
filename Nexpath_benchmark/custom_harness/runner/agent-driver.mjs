@@ -2,8 +2,9 @@
 // Driver for the first two unconditional SWE-EVO turns (control or NexPath).
 // This pilot does not score the benchmark.
 // Control prompts go directly to Claude Code.
-// For NexPath, UserPromptSubmit runs before the agent and Stop afterward.
-// Accepted Stop guidance resumes the same session in a bounded continuation.
+// Standalone NexPath runs call UserPromptSubmit and Stop; processed runner
+// handoffs deliver accepted prompts without calling those hooks again.
+// Accepted standalone Stop guidance resumes the session in bounded continuations.
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -174,7 +175,7 @@ if (existsSync(out)) fail(`output directory already exists: ${out}; refusing to 
 mkdirSync(out, { recursive: true });
 const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 
-// ── nexpath hook isolation ───────────────────────────────────────────────────
+// NexPath hook isolation
 // One fresh SQLite file per RUN, under this run's own output directory. NexPath's
 // config table lives inside this same file, so pointing --db here is sufficient to
 // keep the run's prompts, advisories and config away from ~/.nexpath entirely.
@@ -220,7 +221,7 @@ function callNexpathHook(cmdArgs, stdinPayload, tag) {
   // Exit code 0 includes handled no-guidance outcomes; signals and
   // nonzero exits indicate hook failure.
   if (res.signal) {
-    fail(`nexpath ${cmdArgs[0]} (${tag}) was killed by signal ${res.signal} — likely exceeded `
+    fail(`nexpath ${cmdArgs[0]} (${tag}) was killed by signal ${res.signal}; possibly exceeded `
       + `--nexpath-timeout-seconds=${nexpathTimeoutSeconds}; inspect ${tag}-stderr.log in ${out}`);
   }
   if ((res.stderr || '').includes('pty-run: timeout')) {
@@ -252,7 +253,7 @@ writeFileSync(join(out, 'meta.json'), JSON.stringify({
     nexpath_timeout_seconds: nexpathTimeoutSeconds,
     // home_sandboxed: the file-fallback credential layer (~/.nexpath/config.json) cannot reach
     // the real home directory for this run. keychain_sandboxed is always false: the OS keychain
-    // layer is tied to the login session, not $HOME, and cannot be sandboxed from here — a run
+    // layer is tied to the login session, not $HOME; a run
     // on a machine with a keychain-stored key may still use it even under --no-key.
     credential_isolation: { home_sandboxed: !preprocessedNexpath, nexpath_home: preprocessedNexpath ? null : nexpathHome, keychain_sandboxed: false },
     popup_input: preprocessedNexpath ? 'accepted by run-session' : 'private PTY auto-Enter',
@@ -260,7 +261,7 @@ writeFileSync(join(out, 'meta.json'), JSON.stringify({
   started_at: new Date().toISOString(),
 }, null, 2) + '\n');
 
-// ── agent + Stop-hook-decision helpers ──────────────────────────────────────────
+// Agent and Stop-hook helpers
 function runAgent(prompt, resume) {
   const args = [
     '-p', prompt, '--model', model,
@@ -346,7 +347,7 @@ for (const row of rows) {
 
   let stopDecision = { kind: 'none' };
   if (arm === 'nexpath' && !preprocessedNexpath) {
-    // Stop — only once this agent turn has actually completed (success or failure).
+    // Stop runs after the agent turn, including when the agent fails.
     const stopRes = callNexpathHook(['stop', '--db', dbPath], {
       cwd: project, hook_event_name: 'Stop', stop_hook_active: false,
       session_id: returnedSession ?? sessionId ?? null,
@@ -376,10 +377,9 @@ for (const row of rows) {
   }
   sessionId = returnedSession;
 
-  // ── nexpath arm only: deliver an accepted Stop-hook decision as a bounded chain of
-  // continuations on the SAME Claude Code session. The frozen prompt recorded for this turn
-  // (row.raw_prompt, already sent above) is never replaced — the guidance is a separate,
-  // later turn, exactly as Claude Code's own `{decision:"block",reason}` handling delivers it.
+  // In standalone NexPath mode, accepted Stop guidance resumes the same Claude Code
+  // session. Guidance is a separate continuation; the recorded frozen prompt
+  // remains unchanged.
   let step = 0;
   let pendingDecision = stopDecision;
   let continuationLimitReached = false;
@@ -399,9 +399,8 @@ for (const row of rows) {
     const contCall = runAgent(continuedPrompt, sessionId);
     const { cumulativeDiff: contCumulativeDiff, incrementalDiff: contIncrementalDiff } = writeStepArtifacts(contPrefix, contCall.res);
 
-    // Stop fires with stop_hook_active:true — Claude is continuing BECAUSE of the previous
-    // block, which is precisely the condition the real hook's loop guard (runStop step 1,
-    // src/cli/commands/stop.ts) checks for.
+    // Set stop_hook_active for a continuation after a blocked Stop response,
+    // matching the NexPath hook loop guard (src/cli/commands/stop.ts).
     const contStopRes = callNexpathHook(['stop', '--db', dbPath], {
       cwd: project, hook_event_name: 'Stop', stop_hook_active: true,
       session_id: contCall.returnedSession ?? sessionId ?? null,
@@ -441,10 +440,10 @@ for (const row of rows) {
     pendingDecision = contDecision;
   }
   if (pendingDecision.kind === 'malformed') {
-    console.log(`turn ${row.turn}: WARNING — ignoring malformed Stop-hook decision (${pendingDecision.detail})`);
+    console.log(`turn ${row.turn}: WARNING: ignoring malformed Stop-hook decision (${pendingDecision.detail})`);
   }
   if (continuationLimitReached) {
-    console.log(`turn ${row.turn}: CONTINUATION LIMIT REACHED (${maxContinuations}) — further guidance was not delivered`);
+    console.log(`turn ${row.turn}: CONTINUATION LIMIT REACHED (${maxContinuations}): further guidance was not delivered`);
   }
   rowResult.continuations = step;
   rowResult.continuation_limit_reached = continuationLimitReached;
