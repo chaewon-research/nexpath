@@ -45,9 +45,9 @@ node runner/run-session.mjs \
 agent (`claude -p ... --resume ...`), instead of recording decisions with no agent at
 all. It supports both arms:
 
-- `arm: control` — each prompt goes straight to the agent; NexPath is never invoked,
+- `arm: control`: each prompt goes straight to the agent; NexPath is never invoked,
   even if `--nexpath-cli` is given.
-- `arm: nexpath` — for NexPath runs produced by `run-session.mjs`, delivers the
+- `arm: nexpath`: for NexPath runs produced by `run-session.mjs`, delivers the
   already-accepted `submit` value to the coding agent and does **not** run the
   same hooks twice. For plain-prompt standalone runs, wraps `nexpath auto` and
   `nexpath stop` around each agent turn. The hooks run inside a private PTY
@@ -56,12 +56,12 @@ all. It supports both arms:
 
   When `stop` accepts guidance (the real hook contract: stdout
   `{"decision":"block","reason":...}` on a clean exit), it is delivered to the same
-  Claude Code session as a separate continuation turn via `--resume` — the frozen
+  Claude Code session as a separate continuation turn via `--resume`. The frozen
   prompt in `turns.jsonl` is never rewritten. The continuation's own
   UserPromptSubmit/Stop fire too (Stop with `stop_hook_active:true`, matching Claude
   Code's own loop-guard condition), and the chain is capped by `--max-continuations`
-  (default 2) so a build that keeps blocking cannot loop the driver forever — hitting
-  the cap is logged and recorded, not hidden. Each continuation's prompt, guidance,
+  (default 2) so a build that keeps blocking cannot loop the driver forever. Reaching
+  the cap is logged and recorded. Each continuation's prompt, guidance,
   session id, hook outcome, agent result and patch are recorded in their own row in
   `continuations.jsonl`, separate from the turn's own row in `agent-results.jsonl`.
   Processed NexPath handoffs are accepted only when their existing hook-outcome
