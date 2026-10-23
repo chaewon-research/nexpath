@@ -29,6 +29,8 @@ Default: validate inputs and print a DRY RUN summary (no model calls).
   --max-turns=<n>             per agent response; default: 8
   --timeout-seconds=<n>       per agent response; default: 300
   --agent-bin=<path>          default: claude (replace only for offline tests)
+  --proxy-url=<url>           NexPath record/replay proxy
+  --require-proxy-mode=<m>   verify proxy mode before the run
 
 nexpath arm only (arm must be "nexpath" in the harness meta.json)
   --nexpath-cli=<path>        NexPath's built CLI, by full path       [env NEXPATH_CLI]
@@ -58,6 +60,11 @@ const maxContinuations = Number(flags['max-continuations'] ?? 2);
 const NEXPATH_CLI = String(flags['nexpath-cli'] ?? process.env.NEXPATH_CLI ?? '');
 const ENV_FILE = String(flags['env-file'] ?? process.env.NEXPATH_ENV_FILE ?? '');
 const noKey = !!flags['no-key'];
+const proxyUrl = flags['proxy-url'] === undefined ? '' : String(flags['proxy-url']);
+const requiredProxyMode = flags['require-proxy-mode'] === undefined ? '' : String(flags['require-proxy-mode']);
+if (requiredProxyMode && !['record', 'replay', 'auto'].includes(requiredProxyMode)) fail('invalid --require-proxy-mode');
+if (requiredProxyMode && !proxyUrl) fail('--require-proxy-mode requires --proxy-url');
+if (proxyUrl && !/^https?:\/\//.test(proxyUrl)) fail('--proxy-url must use http:// or https://');
 if (!Number.isSafeInteger(maxTurns) || maxTurns < 1 || maxTurns > 100) fail('--max-turns must be 1..100');
 if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 1800) fail('--timeout-seconds must be 1..1800');
 if (!Number.isSafeInteger(nexpathTimeoutSeconds) || nexpathTimeoutSeconds < 1 || nexpathTimeoutSeconds > 600) fail('--nexpath-timeout-seconds must be 1..600');
@@ -144,6 +151,22 @@ if (!execute) {
   console.log('DRY RUN PASS: no agent or NexPath launched; no output files written');
   process.exit(0);
 }
+let actualProxyMode = null;
+if (proxyUrl) {
+  const statusUrl = proxyUrl.replace(/\/v1\/?$/, '').replace(/\/$/, '') + '/__harness/status';
+  try {
+    const response = await fetch(statusUrl, { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const status = await response.json();
+    if (!['record', 'replay', 'auto'].includes(status.mode)) throw new Error('invalid proxy mode');
+    actualProxyMode = status.mode;
+  } catch (error) {
+    fail('no valid harness proxy answering at ' + statusUrl + ': ' + error.message);
+  }
+  if (requiredProxyMode && actualProxyMode !== requiredProxyMode) {
+    fail('proxy mode is "' + actualProxyMode + '" but --require-proxy-mode=' + requiredProxyMode);
+  }
+}
 if (existsSync(out)) fail(`output directory already exists: ${out}; refusing to overwrite`);
 mkdirSync(out, { recursive: true });
 const sha256 = (text) => createHash('sha256').update(text).digest('hex');
@@ -170,6 +193,7 @@ const nexpathHome = join(out, 'nexpath-home');
 if (arm === 'nexpath' && !preprocessedNexpath) mkdirSync(nexpathHome, { recursive: true }); // control arm never spawns nexpath; nothing to sandbox
 const nexpathEnv = { ...process.env, HOME: nexpathHome };
 if (key) nexpathEnv.OPENAI_API_KEY = key; else delete nexpathEnv.OPENAI_API_KEY;
+if (proxyUrl) nexpathEnv.OPENAI_BASE_URL = proxyUrl;
 
 function callNexpathHook(cmdArgs, stdinPayload, tag) {
   const startedAt = new Date().toISOString();
@@ -205,6 +229,9 @@ writeFileSync(join(out, 'meta.json'), JSON.stringify({
   task: meta.task, arm, starting_commit: startingCommit,
   model, max_turns: maxTurns, timeout_seconds: timeoutSeconds,
   source: turnsFile, source_sha256: sha256(readFileSync(turnsFile)),
+  proxy: proxyUrl || meta.proxy || null,
+  proxy_mode: actualProxyMode || meta.proxy_mode || null,
+  required_proxy_mode: requiredProxyMode || null,
   mode: 'first_two_unconditional_turns_only',
   ...(arm === 'nexpath' ? {
     nexpath_cli: NEXPATH_CLI || meta.nexpath_cli || null,
@@ -225,7 +252,7 @@ writeFileSync(join(out, 'meta.json'), JSON.stringify({
 function runAgent(prompt, resume) {
   const args = [
     '-p', prompt, '--model', model,
-    '--permission-mode', 'acceptEdits',
+    '--permission-mode', 'acceptEdits', '--setting-sources', '',
     '--tools', 'Read,Glob,Grep,Edit,Write',
     '--max-turns', String(maxTurns), '--output-format', 'json',
   ];
@@ -316,7 +343,9 @@ for (const row of rows) {
   };
   console.log(`turn ${row.turn}: exit=${res.status} status=${parsed.subtype || 'unknown'} `
     + `patch=${rowResult.patch_bytes} bytes (own change: ${rowResult.incremental_patch_bytes} bytes)`);
-  if (res.error || res.status !== 0 || parsed.is_error !== false || !returnedSession || (sessionId && returnedSession !== sessionId)) {
+  if (res.error || res.status !== 0 || parsed.is_error !== false
+    || !Number.isSafeInteger(parsed.num_turns) || parsed.num_turns < 1
+    || !returnedSession || (sessionId && returnedSession !== sessionId)) {
     appendFileSync(join(out, 'agent-results.jsonl'), JSON.stringify(rowResult) + '\n');
     fail(`agent turn ${row.turn} failed; inspect artifacts in ${out}`);
   }
@@ -376,6 +405,7 @@ for (const row of rows) {
     console.log(`  turn ${row.turn} continuation ${step}: exit=${contCall.res.status} hook=${contDecision.kind}`);
 
     if (contCall.res.error || contCall.res.status !== 0 || contCall.parsed.is_error !== false
+      || !Number.isSafeInteger(contCall.parsed.num_turns) || contCall.parsed.num_turns < 1
       || !contCall.returnedSession || contCall.returnedSession !== sessionId) {
       rowResult.continuations = step;
       appendFileSync(join(out, 'agent-results.jsonl'), JSON.stringify(rowResult) + '\n');
