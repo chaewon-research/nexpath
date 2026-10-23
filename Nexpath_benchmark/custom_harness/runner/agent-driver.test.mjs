@@ -382,15 +382,62 @@ test('an agent failure during a continuation still runs that continuation\'s Sto
   assert.equal(results[0].continuations,1);
 });
 
-test('rejects a nexpath-arm handoff that already carries NexPath hook-outcome fields from run-session.mjs',()=>{
+test('processed runner handoff delivers accepted submit without re-invoking NexPath hooks',()=>{
   const f=fixtureNexpath();
-  let rows=readFileSync(join(f.run,'turns.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
-  rows[0].fired_flag=null; rows[0].enhanced_prompt=null;
+  const rows=readFileSync(join(f.run,'turns.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  const enhanced='prompt 1\n\nNexPath: check the release notes';
+  for (const row of rows) {
+    row.enhanced_prompt=row.turn===1?enhanced:null;
+    row.submit=row.enhanced_prompt??row.raw_prompt;
+    row.enhanced_used=Boolean(row.enhanced_prompt);
+    row.keeps_original_verbatim=row.enhanced_prompt?true:null;
+    row.fired_flag=row.turn===1?'stage_transition':null;
+    row.pe_status=row.turn===1?'shown':null;
+    row.pe_sections=row.turn===1?1:null;
+  }
   writeFileSync(join(f.run,'turns.jsonl'),rows.map(JSON.stringify).join('\n')+'\n');
-  const r=invoke(f);   // dry run: the rejection must fire before anything is spawned
+  const mockAgent=join(f.root,'mock-agent.cjs');writeMockAgent(mockAgent);
+  const history=join(f.root,'history.jsonl');
+  const r=invoke(f,['--execute','--agent-bin='+mockAgent,'--out='+join(f.root,'outputs')],{MOCK_HISTORY:history});
+  assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
+  const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(calls.map(c=>c.prompt),[enhanced,'prompt 2']);
+  assert.equal(existsSync(join(f.root,'outputs','nexpath-hooks.jsonl')),false);
+  assert.equal(existsSync(join(f.root,'outputs','session.db')),false);
+  const results=readFileSync(join(f.root,'outputs','agent-results.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.notEqual(results[0].submitted_prompt_sha256,results[0].prompt_sha256);
+  const agentMeta=JSON.parse(readFileSync(join(f.root,'outputs','meta.json'),'utf8'));
+  assert.equal(agentMeta.hook_source,'run-session');
+});
+
+test('processed runner handoff with partial hook fields is rejected',()=>{
+  const f=fixtureNexpath();
+  const rows=readFileSync(join(f.run,'turns.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  rows[0].fired_flag='stage_transition';
+  writeFileSync(join(f.run,'turns.jsonl'),rows.map(JSON.stringify).join('\n')+'\n');
+  const r=invoke(f);
   assert.notEqual(r.status,0);
-  assert.match(r.stderr,/already carries NexPath hook-outcome fields/);
-  assert.match(r.stderr,/fired_flag/);
+  assert.match(r.stderr,/incomplete NexPath hook outcome fields/);
+});
+
+test('processed runner handoff refuses an inconsistent accepted prompt',()=>{
+  const f=fixtureNexpath();
+  const rows=readFileSync(join(f.run,'turns.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  for(const row of rows) {
+    row.enhanced_prompt=null;
+    row.submit=row.raw_prompt;
+    row.enhanced_used=false;
+    row.keeps_original_verbatim=null;
+    row.fired_flag=null;
+    row.pe_status=null;
+    row.pe_sections=null;
+  }
+  rows[0].enhanced_prompt='prompt 1 with guidance';
+  rows[0].enhanced_used=true;
+  writeFileSync(join(f.run,'turns.jsonl'),rows.map(JSON.stringify).join('\n')+'\n');
+  const r=invoke(f);
+  assert.notEqual(r.status,0);
+  assert.match(r.stderr,/inconsistent accepted NexPath handoff/);
 });
 
 // Regression tests for terminal isolation, hook failures, credential
