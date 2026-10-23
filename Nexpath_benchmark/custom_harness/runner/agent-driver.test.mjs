@@ -140,6 +140,9 @@ test('mock execution uses one persistent session, records patches and results',(
   const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
   assert.deepEqual(calls,[{prompt:'prompt 1',resume:null},{prompt:'prompt 2',resume:'mock-id'}]);
   assert.match(readFileSync(join(f.root,'outputs','turn-02.patch'),'utf8'),/after-two/);
+  // Patch capture must not leave the project's index staged.
+  shell('git',['-C',f.project,'diff','--cached','--quiet']);
+  assert.match(shell('git',['-C',f.project,'status','--short']),/notes\.txt/);
   const results=readFileSync(join(f.root,'outputs','agent-results.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
   assert.deepEqual(results.map(r=>r.session_id),['mock-id','mock-id']);
 });
@@ -398,7 +401,7 @@ test('processed runner handoff delivers accepted submit without re-invoking NexP
   writeFileSync(join(f.run,'turns.jsonl'),rows.map(JSON.stringify).join('\n')+'\n');
   const mockAgent=join(f.root,'mock-agent.cjs');writeMockAgent(mockAgent);
   const history=join(f.root,'history.jsonl');
-  const r=invoke(f,['--execute','--agent-bin='+mockAgent,'--out='+join(f.root,'outputs')],{MOCK_HISTORY:history});
+  const r=invoke(f,['--execute','--from-runner','--agent-bin='+mockAgent,'--out='+join(f.root,'outputs')],{MOCK_HISTORY:history});
   assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
   const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
   assert.deepEqual(calls.map(c=>c.prompt),[enhanced,'prompt 2']);
@@ -408,6 +411,7 @@ test('processed runner handoff delivers accepted submit without re-invoking NexP
   assert.notEqual(results[0].submitted_prompt_sha256,results[0].prompt_sha256);
   const agentMeta=JSON.parse(readFileSync(join(f.root,'outputs','meta.json'),'utf8'));
   assert.equal(agentMeta.hook_source,'run-session');
+  assert.equal(agentMeta.arm_definition,'fixture');
 });
 
 test('processed runner handoff with partial hook fields is rejected',()=>{
@@ -415,7 +419,7 @@ test('processed runner handoff with partial hook fields is rejected',()=>{
   const rows=readFileSync(join(f.run,'turns.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
   rows[0].fired_flag='stage_transition';
   writeFileSync(join(f.run,'turns.jsonl'),rows.map(JSON.stringify).join('\n')+'\n');
-  const r=invoke(f);
+  const r=invoke(f,['--from-runner']);
   assert.notEqual(r.status,0);
   assert.match(r.stderr,/incomplete NexPath hook outcome fields/);
 });
@@ -435,7 +439,7 @@ test('processed runner handoff refuses an inconsistent accepted prompt',()=>{
   rows[0].enhanced_prompt='prompt 1 with guidance';
   rows[0].enhanced_used=true;
   writeFileSync(join(f.run,'turns.jsonl'),rows.map(JSON.stringify).join('\n')+'\n');
-  const r=invoke(f);
+  const r=invoke(f,['--from-runner']);
   assert.notEqual(r.status,0);
   assert.match(r.stderr,/inconsistent accepted NexPath handoff/);
 });
@@ -747,4 +751,69 @@ process.stdin.on('end', () => {
   assert.notEqual(results[0].submitted_prompt_sha256,results[0].prompt_sha256);
   assert.equal(results[1].enhanced_used,false);
   assert.match(readFileSync(join(out,'turn-01-auto-tty.log'),'utf8'),/Enter sends this prompt/);
+});
+
+test('NexPath hook-outcome handoffs cannot be mistaken for measured standalone runs',()=>{
+  const f=fixtureNexpath();
+  const rows=readFileSync(join(f.run,'turns.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  for (const row of rows) {
+    row.enhanced_prompt=null;
+    row.submit=row.raw_prompt;
+    row.enhanced_used=false;
+    row.fired_flag=null;
+    row.pe_status=null;
+    row.pe_sections=null;
+    row.keeps_original_verbatim=null;
+  }
+  writeFileSync(join(f.run,'turns.jsonl'),rows.map(JSON.stringify).join('\n')+'\n');
+  const result=invoke(f);
+  assert.notEqual(result.status,0);
+  assert.match(result.stderr,/requires --from-runner/);
+});
+
+test('--from-runner rejects standalone NexPath rows without hook outcome fields',()=>{
+  const f=fixtureNexpath();
+  const result=invoke(f,['--from-runner']);
+  assert.notEqual(result.status,0);
+  assert.match(result.stderr,/requires processed NexPath rows/);
+});
+
+test('standalone blocked UserPromptSubmit never forwards the original prompt',()=>{
+  const f=fixtureNexpath();
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const cli=join(f.root,'mock-blocking-auto.cjs');
+  writeFileSync(cli,"#!/usr/bin/env node\nconst fs=require('fs');let input='';process.stdin.on('data',d=>input+=d);process.stdin.on('end',()=>{const payload=JSON.parse(input);const hook=process.argv[2];fs.appendFileSync(process.env.MOCK_HISTORY,JSON.stringify({kind:'nexpath',hook,prompt:payload.prompt||null})+'\\n');if(hook==='auto'&&payload.prompt==='prompt 1')console.log(JSON.stringify({decision:'block',reason:'popup dismissed',suppressOriginalPrompt:true}));});\n");
+  chmodSync(cli,0o755);
+  const history=join(f.root,'history.jsonl'),out=join(f.root,'outputs');
+  const result=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+cli,'--out='+out],{MOCK_HISTORY:history});
+  assert.equal(result.status,0,result.stderr+'\n'+result.stdout);
+  const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(calls.filter(c=>c.kind==='agent').map(c=>c.prompt),['prompt 2']);
+  assert.equal(calls.filter(c=>c.kind==='nexpath'&&c.hook==='stop').length,1);
+  const rows=readFileSync(join(out,'agent-results.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(rows[0].auto_blocked,true);
+  assert.equal(rows[0].agent_invoked,false);
+  assert.equal(rows[0].submitted_prompt_sha256,null);
+  assert.equal(rows[0].block_reason,'popup dismissed');
+  assert.equal(rows[1].auto_blocked,false);
+  assert.equal(JSON.parse(readFileSync(join(out,'meta.json'),'utf8')).arm_definition,'standalone');
+});
+
+test('blocked continuation does not run the agent or its Stop hook',()=>{
+  const f=fixtureNexpath();
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const cli=join(f.root,'mock-cont-block.cjs');
+  writeFileSync(cli,"#!/usr/bin/env node\nconst fs=require('fs');let data='';process.stdin.on('data',d=>data+=d);process.stdin.on('end',()=>{const hook=process.argv[2],payload=JSON.parse(data);const history=process.env.MOCK_HISTORY;const previous=fs.existsSync(history)?fs.readFileSync(history,'utf8').trim().split('\\n').filter(Boolean).map(JSON.parse):[];fs.appendFileSync(history,JSON.stringify({kind:'nexpath',hook,prompt:payload.prompt||null})+'\\n');if(hook==='stop'&&!previous.some(c=>c.hook==='stop'))console.log(JSON.stringify({decision:'block',reason:'please fix issue'}));if(hook==='auto'&&payload.prompt==='please fix issue')console.log(JSON.stringify({decision:'block',reason:'not sent',suppressOriginalPrompt:true}));});\n");
+  chmodSync(cli,0o755);
+  const history=join(f.root,'history.jsonl'),out=join(f.root,'outputs');
+  const result=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+cli,'--out='+out],{MOCK_HISTORY:history});
+  assert.equal(result.status,0,result.stderr+'\n'+result.stdout);
+  const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(calls.filter(c=>c.kind==='agent').map(c=>c.prompt),['prompt 1','prompt 2']);
+  assert.equal(calls.filter(c=>c.kind==='nexpath'&&c.hook==='stop').length,2);
+  const rows=readFileSync(join(out,'continuations.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].auto_blocked,true);
+  assert.equal(rows[0].agent_invoked,false);
+  assert.equal(rows[0].submitted_guidance_sha256,null);
 });
