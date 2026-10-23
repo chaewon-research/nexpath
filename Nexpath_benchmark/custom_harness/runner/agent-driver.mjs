@@ -467,6 +467,54 @@ function parseStopDecision(stdout) {
   return { kind: 'accepted', reason: obj.reason };
 }
 
+// Only new database rows are attributed to the current agent turn or continuation.
+let lastAdvisoryId = null;
+let lastPopupId = null;
+function auditEvidence() {
+  const none = { popup_prepared: false, popup_shown: false, pe_status: null,
+    pe_sections: null, fired_flag: null };
+  if (arm !== 'nexpath' || preprocessedNexpath || !existsSync(dbPath)) return none;
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const available = (table) => Boolean(db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table));
+    const popup = available('pending_prompt_enhancements') ? db.prepare(
+      'SELECT id, status, result_json FROM pending_prompt_enhancements ORDER BY id DESC LIMIT 1').get() : null;
+    const advisory = available('pending_advisories') ? db.prepare(
+      'SELECT id, flag_type FROM pending_advisories ORDER BY id DESC LIMIT 1').get() : null;
+    const popupPrepared = Boolean(popup && popup.id !== lastPopupId);
+    const advisoryFired = Boolean(advisory && advisory.id !== lastAdvisoryId);
+    if (popup) lastPopupId = popup.id;
+    if (advisory) lastAdvisoryId = advisory.id;
+    let sections = null;
+    if (popupPrepared) {
+      try {
+        const parsed = JSON.parse(popup.result_json);
+        sections = Array.isArray(parsed?.currentBody?.sections)
+          ? parsed.currentBody.sections.length : null;
+      } catch { /* malformed evidence stays null */ }
+    }
+    return {
+      popup_prepared: popupPrepared,
+      popup_shown: popupPrepared && popup.status === 'shown',
+      pe_status: popupPrepared ? popup.status : null,
+      pe_sections: sections,
+      fired_flag: advisoryFired ? advisory.flag_type : null,
+    };
+  } finally { db.close(); }
+}
+function eventFields(row, submitted) {
+  const evidence = preprocessedNexpath ? {
+    popup_prepared: null, popup_shown: row.pe_status === 'shown',
+    pe_status: row.pe_status ?? null, pe_sections: row.pe_sections ?? null,
+    fired_flag: row.fired_flag ?? null,
+  } : auditEvidence();
+  return { ...evidence,
+    keeps_original_verbatim: submitted === null || submitted === row.raw_prompt
+      ? null : submitted.includes(row.raw_prompt),
+  };
+}
+
 let sessionId = null;
 let blockedTurns = 0;
 for (const row of rows) {
@@ -483,6 +531,7 @@ for (const row of rows) {
   if (autoBlock) {
     blockedTurns += 1;
     appendFileSync(join(out, 'agent-results.jsonl'), JSON.stringify({
+      ...eventFields(row, null),
       turn: row.turn, prompt_sha256: sha256(row.raw_prompt),
       submitted_prompt_sha256: null, enhanced_used: false,
       auto_blocked: true, block_reason: autoBlock.reason,
@@ -507,6 +556,7 @@ for (const row of rows) {
   }
 
   const rowResult = {
+    ...eventFields(row, submittedPrompt),
     turn: row.turn, prompt_sha256: sha256(row.raw_prompt),
     submitted_prompt_sha256: sha256(submittedPrompt),
     enhanced_used: preprocessedNexpath ? row.enhanced_used : submittedPrompt !== row.raw_prompt,
@@ -550,6 +600,7 @@ for (const row of rows) {
     const contAutoBlock = blockFromAuto(autoContinuation.stdout);
     if (contAutoBlock) {
       appendFileSync(join(out, 'continuations.jsonl'), JSON.stringify({
+        ...eventFields(row, null),
         turn: row.turn, step, original_prompt_sha256: sha256(row.raw_prompt),
         injected_guidance_sha256: sha256(guidance),
         submitted_guidance_sha256: null, auto_blocked: true,
@@ -578,6 +629,7 @@ for (const row of rows) {
     // the session id, the hook outcome, and the agent's execution result each get their own
     // field here, and the patch for this step is its own file (never folded into the turn's).
     appendFileSync(join(out, 'continuations.jsonl'), JSON.stringify({
+      ...eventFields(row, continuedPrompt),
       turn: row.turn, step,
       original_prompt_sha256: sha256(row.raw_prompt),
       injected_guidance: guidance, injected_guidance_sha256: sha256(guidance),
