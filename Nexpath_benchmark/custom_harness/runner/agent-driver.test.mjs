@@ -1009,11 +1009,11 @@ test('continuation audit compares enhanced body with injected guidance, not froz
   const history=join(f.root,'history.jsonl'),out=join(f.root,'outputs');
   const r=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+hook,'--out='+out],
     {MOCK_HISTORY:history,MOCK_STOP_COUNTER:join(f.root,'stop-counter.txt')});
-  assert.equal(r.status,0,r.stderr+'\\n'+r.stdout);
-  const calls=readFileSync(history,'utf8').trim().split('\\n').map(JSON.parse);
+  assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
+  const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
   assert.deepEqual(calls.filter(x=>x.kind==='agent').map(x=>x.prompt),
-    ['prompt 1','please add a regression test\\n\\nNexPath: check it','prompt 2']);
-  const cont=readFileSync(join(out,'continuations.jsonl'),'utf8').trim().split('\\n').map(JSON.parse);
+    ['prompt 1','please add a regression test\n\nNexPath: check it','prompt 2']);
+  const cont=readFileSync(join(out,'continuations.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
   assert.equal(cont.length,1);
   assert.equal(cont[0].enhanced_used,true);
   assert.equal(cont[0].keeps_original_verbatim,true);
