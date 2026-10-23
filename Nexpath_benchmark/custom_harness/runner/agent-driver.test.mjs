@@ -233,7 +233,7 @@ test('rejects a conditional turn when it does not match the frozen prompt file',
   assert.match(r.stderr,/does not match the frozen entry/);
 });
 
-// ── Stop-hook guidance delivery ─────────────────────────────────────────────────
+// Stop-hook guidance delivery
 
 test('accepted Stop-hook guidance is delivered to the same session as a separate continuation turn',()=>{
   const f=fixtureNexpath();
@@ -260,7 +260,7 @@ test('accepted Stop-hook guidance is delivered to the same session as a separate
   // the continuation reuses the SAME session (--resume), never a fresh one
   const agentCalls=calls.filter(c=>c.kind==='agent');
   assert.deepEqual(agentCalls.map(c=>c.resume),[null,'mock-id','mock-id']);
-  // the continuation's own Stop fires stop_hook_active:true — Claude is continuing because of
+  // the continuation's own Stop fires with stop_hook_active:true because Claude continues after
   // the previous block, exactly the condition the real loop guard checks for.
   const stopCalls=calls.filter(c=>c.kind==='nexpath'&&c.hook==='stop');
   assert.deepEqual(stopCalls.map(c=>c.payload.stop_hook_active),[false,true,false]);
@@ -300,7 +300,7 @@ test('a dismissed popup (silent stderr, no stdout decision) is handled identical
   const planPath=join(f.root,'stop-plan.json'); const counterPath=join(f.root,'stop-counter.txt');
   writeMockNexpathStopPlan(mockNexpath,planPath,counterPath);
   // A dismiss writes human-readable noise to STDERR only (as the real hook does on other
-  // outcomes) and nothing to stdout — proving stderr text never leaks into decision parsing.
+  // outcomes) and nothing to stdout, ensuring stderr is never parsed as a decision.
   writeFileSync(planPath,JSON.stringify([]));
   const history=join(f.root,'history.jsonl');
   const r=invoke(f,['--execute',`--agent-bin=${mockAgent}`,`--nexpath-cli=${mockNexpath}`,`--out=${join(f.root,'outputs')}`],
@@ -323,8 +323,8 @@ test('malformed Stop-hook stdout is reported and never treated as accepted guida
   const r=invoke(f,['--execute',`--agent-bin=${mockAgent}`,`--nexpath-cli=${mockNexpath}`,`--out=${join(f.root,'outputs')}`],
     {MOCK_HISTORY:history,MOCK_STOP_PLAN:planPath,MOCK_STOP_COUNTER:counterPath});
   assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
-  assert.match(r.stdout,/turn 1: WARNING — ignoring malformed Stop-hook decision/);
-  assert.match(r.stdout,/turn 2: WARNING — ignoring malformed Stop-hook decision/);
+  assert.match(r.stdout,/turn 1: WARNING: ignoring malformed Stop-hook decision/);
+  assert.match(r.stdout,/turn 2: WARNING: ignoring malformed Stop-hook decision/);
   assert.equal(existsSync(join(f.root,'outputs','continuations.jsonl')),false);
 });
 
@@ -336,7 +336,7 @@ test('a continuation limit stops delivering further guidance and is reported, wi
   writeMockNexpathStopPlan(mockNexpath,planPath,counterPath);
   writeFileSync(planPath,JSON.stringify([
     { decision:'block', reason:'first guidance' },   // turn 1 initial Stop
-    { decision:'block', reason:'second guidance' },   // turn 1 continuation 1's Stop — still blocking
+    { decision:'block', reason:'second guidance' },   // turn 1 continuation 1's Stop, still blocking
     null,                                              // turn 2 initial Stop
   ]));
   const history=join(f.root,'history.jsonl');
@@ -360,7 +360,7 @@ test('an agent failure during a continuation still runs that continuation\'s Sto
   const planPath=join(f.root,'stop-plan.json'); const counterPath=join(f.root,'stop-counter.txt');
   writeMockNexpathStopPlan(mockNexpath,planPath,counterPath);
   writeFileSync(planPath,JSON.stringify([
-    { decision:'block', reason:'please fix the bug' },  // turn 1 initial Stop — accepted
+    { decision:'block', reason:'please fix the bug' },  // turn 1 initial Stop, accepted
     null,                                                 // the failed continuation's own Stop
   ]));
   const history=join(f.root,'history.jsonl');
@@ -445,8 +445,8 @@ test('processed runner handoff refuses an inconsistent accepted prompt',()=>{
 
 // Reports the probing process's own session id (via `ps -o sid=`), so a test can tell
 // whether the nexpath subprocess shares our controlling terminal (same session) or was
-// detached into one of its own (sid === its own pid) — the structural property that
-// determines whether NexPath's `/dev/tty` popup probe could ever attach to this terminal.
+// assigned its own private PTY session (sid === its pid). This verifies that
+// NexPath's `/dev/tty` popup cannot take over the test runner's terminal.
 function writeMockNexpathSidProbe(path) {
   writeFileSync(path, `#!/usr/bin/env node
 const fs = require('fs');
