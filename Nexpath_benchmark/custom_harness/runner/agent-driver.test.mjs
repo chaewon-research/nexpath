@@ -845,6 +845,16 @@ test('all 20 frozen prompts including conditional turns reach one session in exa
   const metadata=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
   assert.equal(metadata.mode,'complete_frozen_session');
   assert.equal(metadata.frozen_prompts,20);
+  const fits=readFileSync(join(out,'fits.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(fits.length,20);
+  assert.deepEqual(fits.map(x=>x.turn),Array.from({length:20},(_,i)=>i+1));
+  assert.equal(fits[0].fits,true);
+  assert.equal(fits[2].fits,false); // no fabricated transcript Read evidence
+  assert.equal(fits[10].fits,true); // the agent actually changed notes.txt
+  assert.equal(fits[15].fits,false); // mock reply was not over 40 lines
+  assert.equal(metadata.fits_summary.measured_as_score,false);
+  assert.equal(metadata.fits_summary.total,20);
+  assert.equal(metadata.fits_summary.fits+metadata.fits_summary.does_not_fit,20);
 });
 
 test('full benchmark input cannot omit later frozen prompts',()=>{
@@ -960,4 +970,32 @@ test('audit fields distinguish prepared and shown popup and count DB sections',(
   assert.equal(rows[1].popup_prepared,false);
   assert.equal(rows[1].popup_shown,false);
   assert.equal(rows[1].fired_flag,null);
+});
+
+
+test('per-turn fits use actual transcript actions and reply evidence without scoring',()=>{
+  const f=fullFrozenFixture();
+  const agent=join(f.root,'agent-with-transcript.cjs');
+  writeFileSync(agent, "#!/usr/bin/env node\nconst fs=require('fs'),path=require('path');\nconst tracker=process.env.MOCK_FIT_COUNTER;\nconst n=fs.existsSync(tracker)?Number(fs.readFileSync(tracker,'utf8'))+1:1;\nfs.writeFileSync(tracker,String(n));\nconst transcript=path.join(process.env.HOME,'.claude','projects','generated-slug','fit-session.jsonl');\nfs.mkdirSync(path.dirname(transcript),{recursive:true});\nif(n===2) fs.appendFileSync(transcript,JSON.stringify({type:'assistant',message:{content:[{type:'tool_use',name:'Read',input:{file_path:'tests/test_import.py'}}]}})+'\\n');\nif(n===4) fs.appendFileSync(transcript,JSON.stringify({type:'assistant',message:{content:[{type:'tool_use',name:'Edit',input:{file_path:'dvc/repo/imp_url.py'}}]}})+'\\n');\nfs.writeFileSync('notes.txt','turn-'+n+'\\n');\nconst reply=n===8?'I suggest updating the option handler in the import command.':n===13?'The slowdown is caused by repeated traversal.':n===15?Array(41).fill('detail').join('\\n'):'done';\nconsole.log(JSON.stringify({session_id:'fit-session',is_error:false,subtype:'success',num_turns:1,result:reply}));\n");
+  chmodSync(agent,0o755);
+  const home=join(f.root,'claude-home'),out=join(f.root,'out');
+  mkdirSync(home);
+  const run=invoke(f,['--execute','--agent-bin='+agent,'--out='+out],{HOME:home,MOCK_FIT_COUNTER:join(f.root,'turn-counter')});
+  assert.equal(run.status,0,run.stderr+'\n'+run.stdout);
+  const fits=readFileSync(join(out,'fits.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(fits.length,20);
+  assert.equal(fits[2].fits,true); // test Read during turn 2
+  assert.equal(fits[4].fits,true); // Edit during turn 4
+  assert.equal(fits[5].fits,true); // Edit before turn 6
+  assert.equal(fits[8].fits,true); // proposed change in turn 8 reply
+  assert.equal(fits[13].fits,true); // diagnosed cause in turn 13
+  assert.equal(fits[15].fits,true); // turn 15 reply has 41 lines
+  const rows=readFileSync(join(out,'agent-results.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(rows[2].fits,true);
+  assert.equal(rows[2].check,'transcript: a test path was read in turn 2');
+  assert.equal(rows[2].assumes,f.frozen.prompts[2].assumes);
+  const meta=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
+  assert.equal(meta.fits_summary.arm,'control');
+  assert.equal(meta.fits_summary.measured_as_score,false);
+  assert.equal(meta.fits_summary.total,20);
 });
