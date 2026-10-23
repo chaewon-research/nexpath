@@ -515,10 +515,141 @@ function eventFields(row, submitted) {
   };
 }
 
+
+// Evidence is captured during execution but assessed only after the full session.
+// Each conditional fit checks prior agent actions or the cumulative diff at that point.
+let priorTranscriptLineCount = 0;
+const observedTurns = new Map();
+function turnObservation(turn) {
+  if (!observedTurns.has(turn)) observedTurns.set(turn, {
+    tools: [], reply: null, transcript_found: false, diff_before: '',
+  });
+  return observedTurns.get(turn);
+}
+function extractToolCalls(value, into) {
+  if (Array.isArray(value)) {
+    for (const part of value) extractToolCalls(part, into);
+  } else if (value && typeof value === 'object') {
+    if (value.type === 'tool_use' && typeof value.name === 'string') {
+      into.push({ name: value.name, input: value.input ?? {} });
+    }
+    for (const item of Object.values(value)) {
+      if (item && typeof item === 'object') extractToolCalls(item, into);
+    }
+  }
+}
+function captureTurnEvidence(turn, parsed, session) {
+  const observation = turnObservation(turn);
+  if (typeof parsed.result === 'string') observation.reply = parsed.result;
+  const transcriptPath = transcriptForSession(session);
+  if (!transcriptPath) return;
+  observation.transcript_found = true;
+  const lines = readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
+  if (lines.length < priorTranscriptLineCount) {
+    fail('Claude transcript unexpectedly became shorter during session ' + session);
+  }
+  for (const line of lines.slice(priorTranscriptLineCount)) {
+    let item;
+    try { item = JSON.parse(line); }
+    catch { fail('invalid JSONL in Claude transcript for session ' + session); }
+    extractToolCalls(item, observation.tools);
+  }
+  priorTranscriptLineCount = lines.length;
+}
+function toolFile(call) {
+  const value = call.input?.file_path ?? call.input?.path ?? call.input?.filePath;
+  return typeof value === 'string' ? value.replace(/\\/g, '/') : '';
+}
+function testFile(path) {
+  return /(?:^|\/)(?:tests?|testing)(?:\/|_|\.|-|$)|(?:^|\/)test_[^/]*|(?:^|\/)[^/]*[._-]test(?:s)?\./i.test(path);
+}
+function importUrlFile(path) {
+  return /(?:imp(?:ort)?[-_]?url|import[-_/]url)/i.test(path) && !testFile(path);
+}
+function patchFiles(diff) {
+  return [...diff.matchAll(/^\+\+\+ b\/(.+)$/gm)].map((x) => x[1]);
+}
+function addedLines(diff) {
+  return diff.split('\n').filter((line) => line.startsWith('+') && !line.startsWith('+++'));
+}
+function fitForEntry(entry, turn) {
+  const check = entry.check;
+  if (check === 'always fits') return { fits: true, evidence: 'unconditional frozen prompt' };
+  const before = [...observedTurns.entries()]
+    .filter(([n]) => n < turn).sort((a,b) => a[0]-b[0]);
+  const earlierCalls = before.flatMap(([,o]) => o.tools);
+  const precedingDiff = turnObservation(turn).diff_before;
+  const changed = patchFiles(precedingDiff);
+  const additions = addedLines(precedingDiff);
+  let fits = false, evidence = '';
+  switch (check) {
+    case 'transcript: a test path was read in turn 2':
+      fits = (observedTurns.get(2)?.tools ?? []).some((c) => c.name === 'Read' && testFile(toolFile(c)));
+      evidence = 'Read of a test path during turn 2';
+      break;
+    case 'transcript: a source file under the import/url area was read before this turn':
+      fits = earlierCalls.some((c) => c.name === 'Read' && importUrlFile(toolFile(c)));
+      evidence = 'Read of import-url source before turn';
+      break;
+    case 'transcript: an edit/write tool call in turn 4':
+      fits = (observedTurns.get(4)?.tools ?? []).some((c) => ['Edit','Write'].includes(c.name));
+      evidence = 'Edit or Write tool use during turn 4';
+      break;
+    case 'transcript: any edit before this turn':
+      fits = earlierCalls.some((c) => ['Edit','Write'].includes(c.name));
+      evidence = 'Edit or Write tool use before turn';
+      break;
+    case 'diff: a new CLI option was added before this turn':
+      fits = additions.some((line) => /--no-download|(?:add_option|\.option\(|@click\.option|Option\()/i.test(line));
+      evidence = 'added CLI option in cumulative pre-turn patch';
+      break;
+    case 'diff: the flag name appears in the diff so far':
+      fits = precedingDiff.includes('--no-download');
+      evidence = '--no-download in cumulative pre-turn patch';
+      break;
+    case 'transcript: the reply to turn 8 proposed a change': {
+      const reply = observedTurns.get(8)?.reply ?? '';
+      fits = /(?:I (?:can|would|will) |(?:we|you) (?:should|could) |(?:I |we )?(?:suggest|recommend|propos))(?:(?:.|\n){0,100})(?:chang|updat|add|modif|implement|fix|adjust|patch)/i.test(reply);
+      evidence = 'turn 8 reply contains an explicit change proposal';
+      break;
+    }
+    case 'diff: a file in the import/url area was changed':
+      fits = changed.some(importUrlFile);
+      evidence = 'import-url source path changed before turn';
+      break;
+    case 'diff: non-empty':
+      fits = Boolean(precedingDiff.trim());
+      evidence = 'nonempty cumulative pre-turn patch';
+      break;
+    case 'diff: the list/recursive code was changed before this turn':
+      fits = changed.some((path) => /(?:list|listing|recursive|(?:^|\/)ls\.|(?:^|\/)fs\/)/i.test(path))
+        && additions.some((line) => /recursive|recursion|travers|list/i.test(line));
+      evidence = 'list/recursive source and related changed lines in pre-turn patch';
+      break;
+    case 'transcript: the reply to turn 13 named a cause':
+      fits = /(?:because|due to|bottleneck|caus(?:e|ed|ing)|overhead|expensive|repeated|traversal|latency|slow(?:ness)? is)/i.test(observedTurns.get(13)?.reply ?? '');
+      evidence = 'turn 13 reply names a performance cause';
+      break;
+    case 'transcript: the previous reply is over 40 lines':
+      fits = (observedTurns.get(turn-1)?.reply ?? '').split('\n').length > 40;
+      evidence = 'previous agent reply exceeds 40 lines';
+      break;
+    case 'diff: the flag name appears and a message/log line was touched':
+      fits = precedingDiff.includes('--no-download')
+        && additions.some((line) => /(?:logger|logging|log\.|print\(|echo |message|downloaded)/i.test(line));
+      evidence = 'flag plus added log/message line in pre-turn patch';
+      break;
+    default:
+      fail('unsupported frozen assumption check on turn ' + turn + ': ' + check);
+  }
+  return { fits, evidence: (fits ? 'matched: ' : 'not found: ') + evidence };
+}
+
 let sessionId = null;
 let blockedTurns = 0;
 for (const row of rows) {
   const prefix = `turn-${String(row.turn).padStart(2, '0')}`;
+  turnObservation(row.turn).diff_before = git('diff', '--binary', startingCommit, previousTreeSha);
 
   let submittedPrompt = preprocessedNexpath ? row.submit : row.raw_prompt;
   let autoBlock = null;
@@ -542,6 +673,7 @@ for (const row of rows) {
     continue;
   }
   const { res, parsed, returnedSession } = runAgent(submittedPrompt, sessionId);
+  captureTurnEvidence(row.turn, parsed, returnedSession);
   const { cumulativeDiff, incrementalDiff } = writeStepArtifacts(prefix, res);
 
   let stopDecision = { kind: 'none' };
@@ -614,6 +746,7 @@ for (const row of rows) {
     }
     const continuedPrompt = promptFromAuto(autoContinuation.stdout, guidance);
     const contCall = runAgent(continuedPrompt, sessionId);
+    captureTurnEvidence(row.turn, contCall.parsed, contCall.returnedSession);
     const { cumulativeDiff: contCumulativeDiff, incrementalDiff: contIncrementalDiff } = writeStepArtifacts(contPrefix, contCall.res);
 
     // Set stop_hook_active for a continuation after a blocked Stop response,
@@ -677,6 +810,25 @@ const readLines = (name) => {
   const file = join(out, name);
   return existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map(JSON.parse) : [];
 };
+const turnResults = readLines('agent-results.jsonl');
+if (frozenEntries) {
+  const assessments = turnResults.map((result) => {
+    const entry = frozenEntries[result.turn - 1];
+    const assessment = fitForEntry(entry, result.turn);
+    return { ...result, assumes: entry.assumes, check: entry.check, fits: assessment.fits,
+      fit_evidence: assessment.evidence };
+  });
+  writeFileSync(join(out, 'agent-results.jsonl'), assessments.map(JSON.stringify).join('\n') + '\n');
+  writeFileSync(join(out, 'fits.jsonl'), assessments.map((x) => JSON.stringify({
+    turn: x.turn, assumes: x.assumes, check: x.check, fits: x.fits, evidence: x.fit_evidence,
+  })).join('\n') + '\n');
+  finalMeta.fits_summary = {
+    arm, arm_definition: finalMeta.arm_definition, measured_as_score: false,
+    total: assessments.length,
+    fits: assessments.filter((x) => x.fits).length,
+    does_not_fit: assessments.filter((x) => !x.fits).length,
+  };
+}
 const recordedSteps = [...readLines('agent-results.jsonl'), ...readLines('continuations.jsonl')];
 finalMeta.finished_at = new Date().toISOString();
 if (arm === 'nexpath' && !preprocessedNexpath) finalMeta.advisory_frequency = readLevel();
