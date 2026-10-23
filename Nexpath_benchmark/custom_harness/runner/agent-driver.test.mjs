@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync, execSync } from 'node:child_process';
+import { spawnSync, spawn, execSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, chmodSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -627,4 +627,93 @@ test('a newly created (untracked) file is captured in the patch, and the increme
   // Turn 2's cumulative patch is strictly bigger than its own incremental change, since the
   // former also carries turn 1's addition and the latter does not.
   assert.ok(results[1].patch_bytes > results[1].incremental_patch_bytes);
+});
+
+test('zero-turn agent result is not considered success',()=>{
+  const f=fixture();
+  const mock=join(f.root,'zero-agent.cjs');
+  writeFileSync(mock,"#!/usr/bin/env node\nconsole.log(JSON.stringify({session_id:'mock-id',is_error:false,subtype:'success',num_turns:0,result:''}));\n");
+  chmodSync(mock,0o755);
+  const out=join(f.root,'outputs');
+  const r=invoke(f,['--execute','--agent-bin='+mock,'--out='+out]);
+  assert.notEqual(r.status,0);
+  assert.match(r.stderr,/agent turn 1 failed/);
+  assert.doesNotMatch(r.stdout,/PILOT COMPLETE/);
+  const row=JSON.parse(readFileSync(join(out,'agent-results.jsonl'),'utf8').trim());
+  assert.equal(row.num_turns,0);
+  assert.equal(row.patch_bytes,0);
+});
+
+test('Claude starts with all setting sources disabled in both arms',()=>{
+  for (const arm of ['control','nexpath']) {
+    const f=arm==='control'?fixture():fixtureNexpath();
+    const agent=join(f.root,'argv-agent.cjs');
+    writeFileSync(agent,"#!/usr/bin/env node\nconst fs=require('fs');fs.appendFileSync(process.env.MOCK_AGENT_ARGS,JSON.stringify(process.argv.slice(2))+'\\n');console.log(JSON.stringify({session_id:'mock-id',is_error:false,subtype:'success',num_turns:1,result:'done'}));\n");
+    chmodSync(agent,0o755);
+    const cli=join(f.root,'mock-nexpath.cjs');writeMockNexpath(cli);
+    const history=join(f.root,'history.jsonl'),argvLog=join(f.root,'argv.jsonl');
+    const args=['--execute','--agent-bin='+agent,'--out='+join(f.root,'outputs')];
+    if(arm==='nexpath')args.push('--nexpath-cli='+cli);
+    const r=invoke(f,args,{MOCK_HISTORY:history,MOCK_AGENT_ARGS:argvLog});
+    assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
+    const calls=readFileSync(argvLog,'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(calls.length,2);
+    for (const argv of calls) {
+      const pos=argv.indexOf('--setting-sources');
+      assert.ok(pos>=0);
+      assert.equal(argv[pos+1],'');
+    }
+  }
+});
+
+test('proxy argument validation and unreachable proxy stop execution',()=>{
+  const f=fixtureNexpath();
+  const withoutUrl=invoke(f,['--require-proxy-mode=replay']);
+  assert.notEqual(withoutUrl.status,0);
+  assert.match(withoutUrl.stderr,/requires --proxy-url/);
+  const cli=join(f.root,'mock-nexpath.cjs');writeMockNexpath(cli);
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const history=join(f.root,'history.jsonl');
+  const unreachable=invoke(f,['--execute','--proxy-url=http://127.0.0.1:1/v1','--require-proxy-mode=replay',
+    '--agent-bin='+agent,'--nexpath-cli='+cli],{MOCK_HISTORY:history});
+  assert.notEqual(unreachable.status,0);
+  assert.match(unreachable.stderr,/no valid harness proxy answering/);
+  assert.equal(existsSync(history),false);
+});
+
+test('proxy replay mode is verified and carried to NexPath hooks',async()=>{
+  const f=fixtureNexpath();
+  const serverScript="const http=require('http');const s=http.createServer((req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({mode:'replay',saved:1}));});s.listen(0,'127.0.0.1',()=>process.stdout.write(String(s.address().port)+'\\n'));";
+  const server=spawn(process.execPath,['-e',serverScript],{stdio:['ignore','pipe','pipe']});
+  const port=await new Promise((resolve,reject)=>{
+    let data='';
+    server.once('error',reject);
+    server.once('exit',()=>reject(new Error('proxy server failed to start')));
+    server.stdout.on('data',part=>{data+=part.toString();if(data.includes('\n'))resolve(Number(data.trim()));});
+  });
+  try {
+    const cli=join(f.root,'nexpath-env.cjs');
+    writeFileSync(cli,"#!/usr/bin/env node\nconst fs=require('fs');fs.appendFileSync(process.env.MOCK_HISTORY,JSON.stringify({base:process.env.OPENAI_BASE_URL||null,hook:process.argv[2]})+'\\n');\n");
+    chmodSync(cli,0o755);
+    const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+    const history=join(f.root,'history.jsonl'),url='http://127.0.0.1:'+port+'/v1';
+    const out=join(f.root,'outputs');
+    const r=invoke(f,['--execute','--proxy-url='+url,'--require-proxy-mode=replay',
+      '--agent-bin='+agent,'--nexpath-cli='+cli,'--out='+out],{MOCK_HISTORY:history});
+    assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
+    const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
+    assert.deepEqual(calls.filter(x=>x.hook).map(x=>x.base),[url,url,url,url]);
+    const meta=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
+    assert.equal(meta.proxy,url);
+    assert.equal(meta.proxy_mode,'replay');
+    const bad=fixtureNexpath();
+    const badHistory=join(bad.root,'history.jsonl');
+    const mismatch=invoke(bad,['--execute','--proxy-url='+url,'--require-proxy-mode=record',
+      '--agent-bin='+agent,'--nexpath-cli='+cli],{MOCK_HISTORY:badHistory});
+    assert.notEqual(mismatch.status,0);
+    assert.match(mismatch.stderr,/proxy mode is "replay"/);
+    assert.equal(existsSync(badHistory),false);
+  } finally {
+    server.kill();
+  }
 });
