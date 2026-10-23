@@ -10,6 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -37,6 +38,7 @@ Default: validate inputs and print a DRY RUN summary (no model calls).
   --timeout-seconds=<n>       per agent response; default: 300
   --agent-bin=<path>          default: claude (replace only for offline tests)
   --from-runner               fixture-only input; not a measured NexPath arm
+  --level=<name>              optimum (default) or every_event; others: off, major_only, once_per_session
   --proxy-url=<url>           NexPath record/replay proxy
   --require-proxy-mode=<m>   verify proxy mode before the run
 
@@ -70,6 +72,10 @@ const maxContinuations = Number(flags['max-continuations'] ?? 2);
 const NEXPATH_CLI = String(flags['nexpath-cli'] ?? process.env.NEXPATH_CLI ?? '');
 const ENV_FILE = String(flags['env-file'] ?? process.env.NEXPATH_ENV_FILE ?? '');
 const noKey = !!flags['no-key'];
+const level = String(flags.level || 'optimum');
+if (!['optimum', 'every_event', 'off', 'major_only', 'once_per_session'].includes(level)) {
+  fail('invalid --level; expected optimum, every_event, off, major_only, or once_per_session');
+}
 const proxyUrl = flags['proxy-url'] === undefined ? '' : String(flags['proxy-url']);
 const requiredProxyMode = flags['require-proxy-mode'] === undefined ? '' : String(flags['require-proxy-mode']);
 if (requiredProxyMode && !['record', 'replay', 'auto'].includes(requiredProxyMode)) fail('invalid --require-proxy-mode');
@@ -201,6 +207,22 @@ const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 // NexPath is invoked as a plain subprocess (never through `nexpath install`), so
 // the user's Claude Code settings are never touched either.
 const dbPath = join(out, 'session.db');
+// Seed the fresh run DB before the first hook without touching global settings.
+// NexPath's own store initialization subsequently creates its remaining tables.
+if (arm === 'nexpath' && !preprocessedNexpath) {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec('CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+    db.prepare('INSERT INTO config(key, value) VALUES (?, ?)').run('advisory_frequency', level);
+  } finally { db.close(); }
+}
+function readLevel() {
+  if (!existsSync(dbPath)) return null;
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try { return db.prepare("SELECT value FROM config WHERE key = 'advisory_frequency'").get()?.value ?? null; }
+  finally { db.close(); }
+}
+
 function keyFromEnvFile() {
   if (process.env.OPENAI_API_KEY) return { key: process.env.OPENAI_API_KEY, from: 'environment' };
   if (!ENV_FILE || !existsSync(ENV_FILE)) return { key: undefined, from: 'missing' };
@@ -281,12 +303,41 @@ function callNexpathHook(cmdArgs, stdinPayload, tag) {
   return res;
 }
 
+function versionOfNexpath() {
+  if (arm !== 'nexpath' || preprocessedNexpath) return null;
+  const root = resolve(dirname(NEXPATH_CLI), '..', '..');
+  let version = null, commit = null, dirty = null;
+  try {
+    const pkg = join(root, 'package.json');
+    if (existsSync(pkg)) version = JSON.parse(readFileSync(pkg, 'utf8')).version ?? null;
+  } catch { /* unavailable, not guessed */ }
+  const gitCall = (args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+  const h = gitCall(['rev-parse', 'HEAD']);
+  if (h.status === 0) {
+    commit = h.stdout.trim();
+    const st = gitCall(['status', '--porcelain']);
+    if (st.status === 0) dirty = Boolean(st.stdout.trim());
+  }
+  return { version, git_commit: commit, git_dirty: dirty };
+}
+function cliVersion() {
+  if (!/(^|[\\/])claude(?:\\.cmd|\\.exe)?$/.test(agentBin)) return null;
+  const r = spawnSync(agentBin, ['--version'], { encoding: 'utf8', timeout: 5000 });
+  return r.status === 0 ? r.stdout.trim() : null;
+}
+
 writeFileSync(join(out, 'meta.json'), JSON.stringify({
   schema: arm === 'control' ? 'agent_driver.control_pilot.v1' : 'agent_driver.nexpath_pilot.v1',
   task: meta.task, arm,
   arm_definition: fromRunner ? 'fixture' : arm === 'nexpath' ? 'standalone' : 'control',
   starting_commit: startingCommit,
   model, max_turns: maxTurns, timeout_seconds: timeoutSeconds,
+  claude_cli_version: cliVersion(),
+  setting_sources: '',
+  setting_sources_argv: ['--setting-sources', ''],
+  level: arm === 'nexpath' && !preprocessedNexpath ? level : null,
+  advisory_frequency: arm === 'nexpath' && !preprocessedNexpath ? readLevel() : null,
+  nexpath_build: versionOfNexpath(),
   source: turnsFile, source_sha256: sha256(readFileSync(turnsFile)),
   proxy: proxyUrl || meta.proxy || null,
   proxy_mode: actualProxyMode || meta.proxy_mode || null,
@@ -310,6 +361,24 @@ writeFileSync(join(out, 'meta.json'), JSON.stringify({
 }, null, 2) + '\n');
 
 // Agent and Stop-hook helpers
+let previousCumulativeCost = 0;
+function agentMetrics(parsed) {
+  const total = typeof parsed.total_cost_usd === 'number' && Number.isFinite(parsed.total_cost_usd)
+    ? parsed.total_cost_usd : null;
+  const delta = total === null ? null : total - previousCumulativeCost;
+  if (total !== null) previousCumulativeCost = total;
+  const raw = parsed.usage && typeof parsed.usage === 'object' ? parsed.usage : {};
+  const token = (key) => Number.isFinite(raw[key]) ? raw[key] : null;
+  return {
+    total_cost_usd: total, cost_delta_usd: delta,
+    usage: {
+      input_tokens: token('input_tokens'), output_tokens: token('output_tokens'),
+      cache_read_input_tokens: token('cache_read_input_tokens'),
+      cache_creation_input_tokens: token('cache_creation_input_tokens'),
+    },
+    duration_ms: typeof parsed.duration_ms === 'number' ? parsed.duration_ms : null,
+  };
+}
 function runAgent(prompt, resume) {
   const args = [
     '-p', prompt, '--model', model,
@@ -442,6 +511,7 @@ for (const row of rows) {
     submitted_prompt_sha256: sha256(submittedPrompt),
     enhanced_used: preprocessedNexpath ? row.enhanced_used : submittedPrompt !== row.raw_prompt,
     auto_blocked: false, agent_invoked: true,
+    ...agentMetrics(parsed),
     exit_code: res.status, signal: res.signal, process_error: res.error?.message || null,
     is_error: parsed.is_error ?? null, subtype: parsed.subtype ?? null,
     session_id: returnedSession, num_turns: parsed.num_turns ?? null,
@@ -513,6 +583,7 @@ for (const row of rows) {
       injected_guidance: guidance, injected_guidance_sha256: sha256(guidance),
       submitted_guidance_sha256: sha256(continuedPrompt),
       auto_blocked: false, agent_invoked: true,
+      ...agentMetrics(contCall.parsed),
       session_id: contCall.returnedSession,
       exit_code: contCall.res.status, signal: contCall.res.signal,
       process_error: contCall.res.error?.message || null,
