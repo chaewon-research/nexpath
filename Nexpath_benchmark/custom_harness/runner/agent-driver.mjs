@@ -318,6 +318,22 @@ function writeStepArtifacts(tag, res) {
   return { cumulativeDiff, incrementalDiff };
 }
 
+// A dismissed UserPromptSubmit popup blocks the prompt and suppresses its
+// original text. Never interpret that decision as permission to send raw input.
+function blockFromAuto(stdout) {
+  for (const line of String(stdout || '').split('\n').map((s) => s.trim()).filter(Boolean).reverse()) {
+    if (!line.startsWith('{') || !line.includes('"decision"')) continue;
+    let parsed;
+    try { parsed = JSON.parse(line); }
+    catch (error) { fail('malformed UserPromptSubmit decision JSON: ' + error.message); }
+    if (parsed?.decision === 'block') {
+      if (parsed.suppressOriginalPrompt !== true) fail('UserPromptSubmit block without suppressOriginalPrompt');
+      return { reason: typeof parsed.reason === 'string' ? parsed.reason : null };
+    }
+  }
+  return null;
+}
+
 // The accepted UserPromptSubmit popup sends its enhanced body on stdout.
 // With no popup, deliver the original prompt unchanged.
 function promptFromAuto(stdout, original) {
@@ -347,15 +363,29 @@ function parseStopDecision(stdout) {
 }
 
 let sessionId = null;
+let blockedTurns = 0;
 for (const row of rows) {
   const prefix = `turn-${String(row.turn).padStart(2, '0')}`;
 
   let submittedPrompt = preprocessedNexpath ? row.submit : row.raw_prompt;
+  let autoBlock = null;
   if (arm === 'nexpath' && !preprocessedNexpath) {
-    // Standalone hook mode: the private PTY accepts the popup before Claude runs.
     const autoResult = callNexpathHook(['auto', '-p', project, '--db', dbPath],
       { prompt: row.raw_prompt, permission_mode: 'bypassPermissions' }, prefix + '-auto');
-    submittedPrompt = promptFromAuto(autoResult.stdout, row.raw_prompt);
+    autoBlock = blockFromAuto(autoResult.stdout);
+    if (!autoBlock) submittedPrompt = promptFromAuto(autoResult.stdout, row.raw_prompt);
+  }
+  if (autoBlock) {
+    blockedTurns += 1;
+    appendFileSync(join(out, 'agent-results.jsonl'), JSON.stringify({
+      turn: row.turn, prompt_sha256: sha256(row.raw_prompt),
+      submitted_prompt_sha256: null, enhanced_used: false,
+      auto_blocked: true, block_reason: autoBlock.reason,
+      agent_invoked: false, session_id: sessionId,
+      continuations: 0, patch_file: null, incremental_patch_file: null,
+    }) + '\n');
+    console.log('turn ' + row.turn + ': UserPromptSubmit blocked; no agent or Stop call');
+    continue;
   }
   const { res, parsed, returnedSession } = runAgent(submittedPrompt, sessionId);
   const { cumulativeDiff, incrementalDiff } = writeStepArtifacts(prefix, res);
@@ -375,6 +405,7 @@ for (const row of rows) {
     turn: row.turn, prompt_sha256: sha256(row.raw_prompt),
     submitted_prompt_sha256: sha256(submittedPrompt),
     enhanced_used: preprocessedNexpath ? row.enhanced_used : submittedPrompt !== row.raw_prompt,
+    auto_blocked: false, agent_invoked: true,
     exit_code: res.status, signal: res.signal, process_error: res.error?.message || null,
     is_error: parsed.is_error ?? null, subtype: parsed.subtype ?? null,
     session_id: returnedSession, num_turns: parsed.num_turns ?? null,
@@ -410,6 +441,20 @@ for (const row of rows) {
     // Stop hook and skips re-processing it as a fresh user prompt; offline tests mock that call.
     const autoContinuation = callNexpathHook(['auto', '-p', project, '--db', dbPath],
       { prompt: guidance, permission_mode: 'bypassPermissions' }, contPrefix + '-auto');
+    const contAutoBlock = blockFromAuto(autoContinuation.stdout);
+    if (contAutoBlock) {
+      appendFileSync(join(out, 'continuations.jsonl'), JSON.stringify({
+        turn: row.turn, step, original_prompt_sha256: sha256(row.raw_prompt),
+        injected_guidance_sha256: sha256(guidance),
+        submitted_guidance_sha256: null, auto_blocked: true,
+        block_reason: contAutoBlock.reason, agent_invoked: false,
+        session_id: sessionId, hook_outcome: 'auto_blocked',
+        patch_file: null, incremental_patch_file: null,
+      }) + '\n');
+      console.log('turn ' + row.turn + ' continuation ' + step + ': UserPromptSubmit blocked; no agent or Stop call');
+      pendingDecision = { kind: 'none' };
+      break;
+    }
     const continuedPrompt = promptFromAuto(autoContinuation.stdout, guidance);
     const contCall = runAgent(continuedPrompt, sessionId);
     const { cumulativeDiff: contCumulativeDiff, incrementalDiff: contIncrementalDiff } = writeStepArtifacts(contPrefix, contCall.res);
@@ -431,6 +476,7 @@ for (const row of rows) {
       original_prompt_sha256: sha256(row.raw_prompt),
       injected_guidance: guidance, injected_guidance_sha256: sha256(guidance),
       submitted_guidance_sha256: sha256(continuedPrompt),
+      auto_blocked: false, agent_invoked: true,
       session_id: contCall.returnedSession,
       exit_code: contCall.res.status, signal: contCall.res.signal,
       process_error: contCall.res.error?.message || null,
@@ -465,3 +511,4 @@ for (const row of rows) {
   appendFileSync(join(out, 'agent-results.jsonl'), JSON.stringify(rowResult) + '\n');
 }
 console.log(`${arm.toUpperCase()} PILOT COMPLETE (NOT SCORED): ${out}`);
+if (blockedTurns) console.log(`UserPromptSubmit blocked ${blockedTurns} frozen turn(s); no agent calls were made for those turns`);
