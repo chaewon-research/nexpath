@@ -8,7 +8,8 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -17,6 +18,8 @@ const HARNESS = resolve(HERE, '..');
 const PTY_RUN = join(HERE, 'pty-run.py');
 const PYTHON = process.env.HARNESS_PYTHON || 'python3';
 const POPUP_MARKER = 'Enter sends this prompt';
+// Capture the real home before giving NexPath hooks their isolated HOME.
+const realHome = homedir();
 
 const flags = Object.fromEntries(process.argv.slice(2).map((arg) => {
   const [name, ...pieces] = arg.replace(/^--/, '').split('=');
@@ -215,6 +218,32 @@ const nexpathEnv = { ...process.env, HOME: nexpathHome };
 if (key) nexpathEnv.OPENAI_API_KEY = key; else delete nexpathEnv.OPENAI_API_KEY;
 if (proxyUrl) nexpathEnv.OPENAI_BASE_URL = proxyUrl;
 
+// Claude Code stores session transcripts beneath its project slug. Never derive
+// the slug from cwd: find the actual file by its returned session id.
+function transcriptForSession(sessionId) {
+  if (!sessionId) return null;
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) fail('unexpected Claude Code session id for transcript lookup');
+  const projectsDir = join(realHome, '.claude', 'projects');
+  if (!existsSync(projectsDir)) return null;
+  const matches = readdirSync(projectsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => join(projectsDir, entry.name, sessionId + '.jsonl'))
+    .filter((candidate) => existsSync(candidate));
+  if (matches.length > 1) fail('ambiguous Claude Code transcript for session ' + sessionId);
+  return matches[0] ?? null;
+}
+function autoPayload(prompt, activeSessionId) {
+  const payload = { prompt, permission_mode: 'bypassPermissions' };
+  if (activeSessionId) {
+    const transcriptPath = transcriptForSession(activeSessionId);
+    if (!transcriptPath && agentBin === 'claude') {
+      fail('Claude Code transcript not found for session ' + activeSessionId);
+    }
+    if (transcriptPath) payload.transcript_path = transcriptPath;
+  }
+  return payload;
+}
+
 function callNexpathHook(cmdArgs, stdinPayload, tag) {
   const startedAt = new Date().toISOString();
   const res = spawnSync(PYTHON, [
@@ -378,7 +407,7 @@ for (const row of rows) {
   let autoBlock = null;
   if (arm === 'nexpath' && !preprocessedNexpath) {
     const autoResult = callNexpathHook(['auto', '-p', project, '--db', dbPath],
-      { prompt: row.raw_prompt, permission_mode: 'bypassPermissions' }, prefix + '-auto');
+      autoPayload(row.raw_prompt, sessionId), prefix + '-auto');
     autoBlock = blockFromAuto(autoResult.stdout);
     if (!autoBlock) submittedPrompt = promptFromAuto(autoResult.stdout, row.raw_prompt);
   }
@@ -447,7 +476,7 @@ for (const row of rows) {
     // src/decision-session/whydesc-delivery.ts) is what recognises this text came from its own
     // Stop hook and skips re-processing it as a fresh user prompt; offline tests mock that call.
     const autoContinuation = callNexpathHook(['auto', '-p', project, '--db', dbPath],
-      { prompt: guidance, permission_mode: 'bypassPermissions' }, contPrefix + '-auto');
+      autoPayload(guidance, sessionId), contPrefix + '-auto');
     const contAutoBlock = blockFromAuto(autoContinuation.stdout);
     if (contAutoBlock) {
       appendFileSync(join(out, 'continuations.jsonl'), JSON.stringify({
