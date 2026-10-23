@@ -53,6 +53,9 @@ rejected. It supports both arms:
   using a private PTY from `runner/pty-run.py`. Accepted `additionalContext`
   reaches the agent, while an explicit UserPromptSubmit block sends nothing.
   Each standalone run gets a fresh run-local `session.db`.
+  From the second turn onward, `auto` receives the real Claude Code session
+  transcript path, located from the real HOME by session id rather than guessed
+  from the project slug. Continuation prompts also carry this path.
   `--from-runner` accepts preprocessed NexPath rows from `run-session.mjs`
   without repeating hooks, but marks the output `arm_definition: "fixture"`.
   Fixture runs must not be interpreted as measured NexPath-arm results.
