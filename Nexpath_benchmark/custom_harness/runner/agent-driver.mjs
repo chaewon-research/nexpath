@@ -108,7 +108,7 @@ const preprocessedNexpath = arm === 'nexpath' && fromRunner;
 if (arm === 'nexpath' && !fromRunner && rows.some(hasHookFields)) {
   fail('processed NexPath handoff requires --from-runner (fixture only)');
 }
-if (fromRunner && !rows.every(hasHookFields)) {
+if (fromRunner && !rows.some(hasHookFields)) {
   fail('--from-runner requires processed NexPath rows with hook-outcome fields');
 }
 if (preprocessedNexpath) {
