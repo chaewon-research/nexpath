@@ -39,11 +39,12 @@ node runner/run-session.mjs \
   --proxy-url=http://127.0.0.1:8787/v1 --require-proxy-mode=record
 ```
 
-## Agent driver pilot (experimental)
+## Agent driver (experimental)
 
-`runner/agent-driver.mjs` hands the frozen turns-1-and-2 only to a real Claude Code
-agent (`claude -p ... --resume ...`), instead of recording decisions with no agent at
-all. It supports both arms:
+`runner/agent-driver.mjs` hands the complete frozen prompt list, in order, to
+Claude Code (`claude -p ... --resume ...`), including conditional turns.
+Real tasks must provide all frozen rows in `turns.jsonl`; shortened runs are
+rejected. It supports both arms:
 
 - `arm: control`: each prompt goes straight to the agent; NexPath is never invoked,
   even if `--nexpath-cli` is given.
@@ -98,8 +99,10 @@ node runner/agent-driver.mjs --turns=runs/<run-id>/turns.jsonl --project=<checko
 # For repeatable live hook calls, pass --proxy-url=... --require-proxy-mode=replay
 ```
 
-It validates turns 1-2 only and explicitly rejects anything that doesn't match the
-frozen, always-fits entries in `prompts/<task>.json`. See `--help` for every flag.
+It validates every prompt against the corresponding frozen entry in
+`prompts/<task>.json` without skipping conditional turns. The post-run
+`fits` evidence assessment and expanded per-turn audit fields are not yet
+implemented. See `--help` for every flag.
 
 Then grade the popups it produced:
 
