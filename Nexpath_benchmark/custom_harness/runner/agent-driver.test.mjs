@@ -136,7 +136,7 @@ test('mock execution uses one persistent session, records patches and results',(
   writeFileSync(mock,`#!/usr/bin/env node\nconst fs=require('fs');\nconst a=process.argv.slice(2);\nconst prompt=a[a.indexOf('-p')+1];\nconst resume=a.includes('--resume')?a[a.indexOf('--resume')+1]:null;\nif((prompt==='prompt 1'&&resume)||(prompt==='prompt 2'&&resume!=='mock-id'))process.exit(9);\nfs.appendFileSync(process.env.MOCK_HISTORY,JSON.stringify({prompt,resume})+'\\n');\nfs.writeFileSync('notes.txt', prompt === 'prompt 1' ? 'after-one\\n':'after-two\\n');\nconsole.log(JSON.stringify({session_id:'mock-id',is_error:false,subtype:'success',num_turns:1,result:'done'}));\n`);
   chmodSync(mock,0o755);
   const r=invoke(f,['--execute',`--agent-bin=${mock}`,`--out=${join(f.root,'outputs')}`],{MOCK_HISTORY:history});
-  assert.equal(r.status,0,r.stderr+'\n'+r.stdout);assert.match(r.stdout,/CONTROL PILOT COMPLETE/);
+  assert.equal(r.status,0,r.stderr+'\n'+r.stdout);assert.match(r.stdout,/CONTROL SESSION COMPLETE/);
   const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
   assert.deepEqual(calls,[{prompt:'prompt 1',resume:null},{prompt:'prompt 2',resume:'mock-id'}]);
   assert.match(readFileSync(join(f.root,'outputs','turn-02.patch'),'utf8'),/after-two/);
@@ -154,7 +154,7 @@ test('nexpath arm calls UserPromptSubmit before the agent and Stop only after it
   const history=join(f.root,'history.jsonl');
   const r=invoke(f,['--execute',`--agent-bin=${mockAgent}`,`--nexpath-cli=${mockNexpath}`,`--out=${join(f.root,'outputs')}`],{MOCK_HISTORY:history});
   assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
-  assert.match(r.stdout,/NEXPATH PILOT COMPLETE/);
+  assert.match(r.stdout,/NEXPATH SESSION COMPLETE/);
   const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
   assert.deepEqual(calls.map(c=>c.kind==='nexpath'?`${c.kind}:${c.hook}`:`${c.kind}:${c.prompt}`),
     ['nexpath:auto','agent:prompt 1','nexpath:stop','nexpath:auto','agent:prompt 2','nexpath:stop']);
@@ -172,7 +172,7 @@ test('control arm never invokes NexPath, even when a (broken) --nexpath-cli is s
   const history=join(f.root,'history.jsonl');
   const r=invoke(f,['--execute',`--agent-bin=${mockAgent}`,'--nexpath-cli=/does/not/exist',`--out=${join(f.root,'outputs')}`],{MOCK_HISTORY:history});
   assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
-  assert.match(r.stdout,/CONTROL PILOT COMPLETE/);
+  assert.match(r.stdout,/CONTROL SESSION COMPLETE/);
   assert.equal(existsSync(join(f.root,'outputs','nexpath-hooks.jsonl')),false);
   assert.equal(existsSync(join(f.root,'outputs','session.db')),false);
   const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
@@ -253,7 +253,7 @@ test('accepted Stop-hook guidance is delivered to the same session as a separate
   const r=invoke(f,['--execute',`--agent-bin=${mockAgent}`,`--nexpath-cli=${mockNexpath}`,`--out=${join(f.root,'outputs')}`],
     {MOCK_HISTORY:history,MOCK_STOP_PLAN:planPath,MOCK_STOP_COUNTER:counterPath});
   assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
-  assert.match(r.stdout,/NEXPATH PILOT COMPLETE/);
+  assert.match(r.stdout,/NEXPATH SESSION COMPLETE/);
   const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse);
   assert.deepEqual(calls.map(c=>c.kind==='nexpath'?`${c.kind}:${c.hook}`:`${c.kind}:${c.prompt}`),[
     'nexpath:auto','agent:prompt 1','nexpath:stop',
@@ -640,7 +640,7 @@ test('zero-turn agent result is not considered success',()=>{
   const r=invoke(f,['--execute','--agent-bin='+mock,'--out='+out]);
   assert.notEqual(r.status,0);
   assert.match(r.stderr,/agent turn 1 failed/);
-  assert.doesNotMatch(r.stdout,/PILOT COMPLETE/);
+  assert.doesNotMatch(r.stdout,/SESSION COMPLETE/);
   const row=JSON.parse(readFileSync(join(out,'agent-results.jsonl'),'utf8').trim());
   assert.equal(row.num_turns,0);
   assert.equal(row.patch_bytes,0);
@@ -816,4 +816,51 @@ test('blocked continuation does not run the agent or its Stop hook',()=>{
   assert.equal(rows[0].auto_blocked,true);
   assert.equal(rows[0].agent_invoked,false);
   assert.equal(rows[0].submitted_guidance_sha256,null);
+});
+
+
+function fullFrozenFixture() {
+  const f=fixture();
+  const task='iterative__dvc_2.19.0_2.20.0';
+  const frozen=JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)),'..','prompts',task+'.json'),'utf8'));
+  const rows=frozen.prompts.map(p=>({turn:p.n,raw_prompt:p.text,submit:p.text,enhanced_used:false}));
+  writeFileSync(join(f.run,'meta.json'),JSON.stringify({schema:'custom_harness.run.v1',arm:'control',project:f.project,task}));
+  writeFileSync(join(f.run,'turns.jsonl'),rows.map(JSON.stringify).join('\n')+'\n');
+  return { ...f, frozen, rows };
+}
+
+test('all 20 frozen prompts including conditional turns reach one session in exact order',()=>{
+  const f=fullFrozenFixture();
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const history=join(f.root,'history.jsonl'),out=join(f.root,'outputs');
+  const r=invoke(f,['--execute','--agent-bin='+agent,'--out='+out],{MOCK_HISTORY:history});
+  assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
+  assert.match(r.stdout,/SESSION COMPLETE/);
+  const calls=readFileSync(history,'utf8').trim().split('\n').map(JSON.parse).filter(c=>c.kind==='agent');
+  assert.equal(calls.length,20);
+  assert.deepEqual(calls.map(c=>c.prompt),f.rows.map(p=>p.raw_prompt));
+  assert.deepEqual(calls.map(c=>c.resume),[null,...Array(19).fill('mock-id')]);
+  const results=readFileSync(join(out,'agent-results.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(results.map(x=>x.turn),Array.from({length:20},(_,i)=>i+1));
+  const metadata=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
+  assert.equal(metadata.mode,'complete_frozen_session');
+  assert.equal(metadata.frozen_prompts,20);
+});
+
+test('full benchmark input cannot omit later frozen prompts',()=>{
+  const f=fullFrozenFixture();
+  writeFileSync(join(f.run,'turns.jsonl'),f.rows.slice(0,2).map(JSON.stringify).join('\n')+'\n');
+  const r=invoke(f);
+  assert.notEqual(r.status,0);
+  assert.match(r.stderr,/full frozen session requires all 20 prompts/);
+});
+
+test('full benchmark input cannot reorder frozen prompts',()=>{
+  const f=fullFrozenFixture();
+  const reordered=[...f.rows];
+  [reordered[3],reordered[4]]=[reordered[4],reordered[3]];
+  writeFileSync(join(f.run,'turns.jsonl'),reordered.map(JSON.stringify).join('\n')+'\n');
+  const r=invoke(f);
+  assert.notEqual(r.status,0);
+  assert.match(r.stderr,/inconsistent frozen handoff/);
 });
