@@ -21,6 +21,41 @@ const PYTHON = process.env.HARNESS_PYTHON || 'python3';
 const POPUP_MARKER = 'Enter sends this prompt';
 // Capture the real home before giving NexPath hooks their isolated HOME.
 const realHome = homedir();
+const POPUP_HEADER = [
+  'The user explicitly selected this validated Nexpath enhanced prompt.',
+  'Treat it as the operative task context; it preserves the original request and adds preparation guidance.',
+  '',
+].join('\n') + '\n';
+
+function popupBody(additionalContext) {
+  if (additionalContext.startsWith(POPUP_HEADER)) return additionalContext.slice(POPUP_HEADER.length);
+  if (additionalContext.startsWith(POPUP_HEADER.split('\n')[0])) {
+    fail('NexPath enhanced context wrapper changed; refusing to grade wrapper text as popup body');
+  }
+  return additionalContext;
+}
+function hostHookSettings() {
+  const path = join(realHome, '.claude', 'settings.json');
+  const summary = { settings_file_exists: existsSync(path), hooks_key_present: false,
+    hook_event_keys: [], hook_entry_count: 0, registered_hook_count: 0, parse_error: false };
+  if (!summary.settings_file_exists) return summary;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    summary.hooks_key_present = Boolean(parsed && Object.hasOwn(parsed, 'hooks'));
+    const hooks = parsed?.hooks;
+    if (hooks && typeof hooks === 'object' && !Array.isArray(hooks)) {
+      summary.hook_event_keys = Object.keys(hooks).sort();
+      for (const entries of Object.values(hooks)) {
+        if (!Array.isArray(entries)) continue;
+        summary.hook_entry_count += entries.length;
+        for (const entry of entries) {
+          if (Array.isArray(entry?.hooks)) summary.registered_hook_count += entry.hooks.length;
+        }
+      }
+    }
+  } catch { summary.parse_error = true; }
+  return summary;
+}
 
 const flags = Object.fromEntries(process.argv.slice(2).map((arg) => {
   const [name, ...pieces] = arg.replace(/^--/, '').split('=');
@@ -207,6 +242,19 @@ const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 // NexPath is invoked as a plain subprocess (never through `nexpath install`), so
 // the user's Claude Code settings are never touched either.
 const dbPath = join(out, 'session.db');
+const popupDir = join(out, 'popups');
+const continuationPopupDir = join(popupDir, 'continuations');
+mkdirSync(popupDir, { recursive: true });
+let popupsWritten = 0;
+function writePopup(turn, additionalContext, step = null) {
+  const directory = step == null ? popupDir : continuationPopupDir;
+  mkdirSync(directory, { recursive: true });
+  const n = String(turn).padStart(2, '0');
+  const filename = step == null ? `${n}.txt` : `${n}-cont-${String(step).padStart(2, '0')}.txt`;
+  writeFileSync(join(directory, filename), popupBody(additionalContext));
+  popupsWritten += 1;
+}
+
 // Seed the fresh run DB before the first hook without touching global settings.
 // NexPath's own store initialization subsequently creates its remaining tables.
 if (arm === 'nexpath' && !preprocessedNexpath) {
@@ -267,6 +315,8 @@ function autoPayload(prompt, activeSessionId) {
 }
 
 function callNexpathHook(cmdArgs, stdinPayload, tag) {
+  const inputText = JSON.stringify(stdinPayload);
+  writeFileSync(join(out, tag + '-stdin.json'), inputText + '\n');
   const startedAt = new Date().toISOString();
   const res = spawnSync(PYTHON, [
     PTY_RUN, '--marker=' + POPUP_MARKER, '--quiet-ms=2000',
@@ -275,7 +325,7 @@ function callNexpathHook(cmdArgs, stdinPayload, tag) {
     '--', process.execPath, NEXPATH_CLI, ...cmdArgs,
   ], {
     cwd: project, env: nexpathEnv, encoding: 'utf8',
-    input: JSON.stringify(stdinPayload), timeout: (nexpathTimeoutSeconds + 5) * 1000,
+    input: inputText, timeout: (nexpathTimeoutSeconds + 5) * 1000,
     maxBuffer: 16 * 1024 * 1024,
   });
   // spawnSync reports its timeout through res.error. External signals
@@ -329,12 +379,15 @@ function cliVersion() {
 writeFileSync(join(out, 'meta.json'), JSON.stringify({
   schema: arm === 'control' ? 'agent_driver.control_pilot.v1' : 'agent_driver.nexpath_pilot.v1',
   task: meta.task, arm,
+  prompts_file: frozenEntries ? resolve(frozenPath) : null,
+  popups_shown: 0,
   arm_definition: fromRunner ? 'fixture' : arm === 'nexpath' ? 'standalone' : 'control',
   starting_commit: startingCommit,
   model, max_turns: maxTurns, timeout_seconds: timeoutSeconds,
   claude_cli_version: cliVersion(),
   setting_sources: '',
   setting_sources_argv: ['--setting-sources', ''],
+  host_claude_hooks: hostHookSettings(),
   level: arm === 'nexpath' && !preprocessedNexpath ? level : null,
   advisory_frequency: arm === 'nexpath' && !preprocessedNexpath ? readLevel() : null,
   nexpath_build: versionOfNexpath(),
@@ -470,6 +523,7 @@ function parseStopDecision(stdout) {
 // Only new database rows are attributed to the current agent turn or continuation.
 let lastAdvisoryId = null;
 let lastPopupId = null;
+let lastShownPopupCount = 0;
 function auditEvidence() {
   const none = { popup_prepared: false, popup_shown: false, pe_status: null,
     pe_sections: null, fired_flag: null };
@@ -482,6 +536,15 @@ function auditEvidence() {
       'SELECT id, status, result_json FROM pending_prompt_enhancements ORDER BY id DESC LIMIT 1').get() : null;
     const advisory = available('pending_advisories') ? db.prepare(
       'SELECT id, flag_type FROM pending_advisories ORDER BY id DESC LIMIT 1').get() : null;
+    const sessionRow = available('session_states') ? db.prepare(
+      'SELECT state_json FROM session_states LIMIT 1').get() : null;
+    const sessionState = sessionRow ? JSON.parse(sessionRow.state_json) : {};
+    const shownNow = sessionState.shownPopupCount ?? 0;
+    if (!Number.isSafeInteger(shownNow) || shownNow < lastShownPopupCount) {
+      fail('invalid or regressed shownPopupCount in NexPath session state');
+    }
+    const shownDelta = shownNow - lastShownPopupCount;
+    lastShownPopupCount = shownNow;
     const popupPrepared = Boolean(popup && popup.id !== lastPopupId);
     const advisoryFired = Boolean(advisory && advisory.id !== lastAdvisoryId);
     if (popup) lastPopupId = popup.id;
@@ -496,7 +559,9 @@ function auditEvidence() {
     }
     return {
       popup_prepared: popupPrepared,
-      popup_shown: popupPrepared && popup.status === 'shown',
+      popup_shown: shownDelta > 0,
+      popup_shown_count: shownDelta,
+      last_prompt_enhancement_prompt_index: sessionState.lastPromptEnhancementPromptIndex ?? null,
       pe_status: popupPrepared ? popup.status : null,
       pe_sections: sections,
       fired_flag: advisoryFired ? advisory.flag_type : null,
@@ -657,7 +722,10 @@ for (const row of rows) {
     const autoResult = callNexpathHook(['auto', '-p', project, '--db', dbPath],
       autoPayload(row.raw_prompt, sessionId), prefix + '-auto');
     autoBlock = blockFromAuto(autoResult.stdout);
-    if (!autoBlock) submittedPrompt = promptFromAuto(autoResult.stdout, row.raw_prompt);
+    if (!autoBlock) {
+      submittedPrompt = promptFromAuto(autoResult.stdout, row.raw_prompt);
+      if (submittedPrompt !== row.raw_prompt) writePopup(row.turn, submittedPrompt);
+    }
   }
   if (autoBlock) {
     blockedTurns += 1;
@@ -697,6 +765,9 @@ for (const row of rows) {
     exit_code: res.status, signal: res.signal, process_error: res.error?.message || null,
     is_error: parsed.is_error ?? null, subtype: parsed.subtype ?? null,
     session_id: returnedSession, num_turns: parsed.num_turns ?? null,
+    hook_outcome: arm === 'nexpath' && !preprocessedNexpath ? stopDecision.kind : null,
+    hook_reason: stopDecision.kind === 'accepted' ? stopDecision.reason : null,
+    hook_detail: stopDecision.kind === 'malformed' ? stopDecision.detail : null,
     continuations: 0, continuation_limit_reached: false,
     patch_file: `${prefix}.patch`, patch_bytes: Buffer.byteLength(cumulativeDiff),
     incremental_patch_file: `${prefix}-incremental.patch`, incremental_patch_bytes: Buffer.byteLength(incrementalDiff),
@@ -745,6 +816,7 @@ for (const row of rows) {
       break;
     }
     const continuedPrompt = promptFromAuto(autoContinuation.stdout, guidance);
+    if (continuedPrompt !== guidance) writePopup(row.turn, continuedPrompt, step);
     const contCall = runAgent(continuedPrompt, sessionId);
     captureTurnEvidence(row.turn, contCall.parsed, contCall.returnedSession);
     const { cumulativeDiff: contCumulativeDiff, incrementalDiff: contIncrementalDiff } = writeStepArtifacts(contPrefix, contCall.res);
@@ -832,10 +904,14 @@ if (frozenEntries) {
 }
 const recordedSteps = [...readLines('agent-results.jsonl'), ...readLines('continuations.jsonl')];
 finalMeta.finished_at = new Date().toISOString();
+finalMeta.popups_shown = popupsWritten;
 if (arm === 'nexpath' && !preprocessedNexpath) finalMeta.advisory_frequency = readLevel();
 finalMeta.audit_totals = {
   popup_prepared: recordedSteps.filter((x) => x.popup_prepared === true).length,
-  popup_shown: recordedSteps.filter((x) => x.popup_shown === true).length,
+  popup_shown: recordedSteps.reduce((sum, x) => sum + (x.popup_shown_count ?? (x.popup_shown === true ? 1 : 0)), 0),
+  popup_files_written: popupsWritten,
+  malformed_stop_decisions: recordedSteps.filter((x) => x.hook_outcome === 'malformed').length,
+  undelivered_guidance_turns: recordedSteps.filter((x) => x.continuation_limit_reached === true).length,
   cost_delta_usd: recordedSteps.reduce((sum, x) => sum + (x.cost_delta_usd ?? 0), 0),
   cost_records: recordedSteps.filter((x) => x.cost_delta_usd !== null && x.cost_delta_usd !== undefined).length,
 };
