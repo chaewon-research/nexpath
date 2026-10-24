@@ -1023,6 +1023,9 @@ test('continuation audit compares enhanced body with injected guidance, not froz
   assert.equal(cont.length,1);
   assert.equal(cont[0].enhanced_used,true);
   assert.equal(cont[0].keeps_original_verbatim,true);
+  assert.equal(readFileSync(join(out,'popups','continuations','01-cont-01.txt'),'utf8'),
+    'please add a regression test\n\nNexPath: check it');
+  assert.equal(JSON.parse(readFileSync(join(out,'meta.json'),'utf8')).popups_shown,1);
   assert.notEqual(cont[0].submitted_guidance_sha256,cont[0].injected_guidance_sha256);
 });
 
