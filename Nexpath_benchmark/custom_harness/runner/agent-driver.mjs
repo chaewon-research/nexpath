@@ -725,11 +725,15 @@ function fitForEntry(entry, turn) {
       fits = (observedTurns.get(turn-1)?.reply ?? '').split('\n').length > 40;
       evidence = 'previous agent reply exceeds 40 lines';
       break;
-    case 'diff: the flag name appears and a message/log line was touched':
-      fits = precedingDiff.includes('--no-download')
-        && additions.some((line) => /(?:logger|logging|log\.|print\(|echo |message|downloaded)/i.test(line));
-      evidence = 'flag plus added log/message line in pre-turn patch';
+    case 'diff: the flag name appears and a message/log line was touched': {
+      const flag = implementationLines.find((x) => x.text.includes('--no-download'));
+      const logLine = implementationLines.find((x) =>
+        /(?:logger|logging|log\.|print\(|echo |message|downloaded)/i.test(x.text));
+      fits = Boolean(flag && logLine);
+      matchedLine = fits ? `${flag.path}: +${flag.text}; ${logLine.path}: +${logLine.text}` : null;
+      evidence = 'flag plus added message/log line in import-url source';
       break;
+    }
     default:
       fail('unsupported frozen assumption check on turn ' + turn + ': ' + check);
   }
