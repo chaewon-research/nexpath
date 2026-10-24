@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, spawn, execSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, chmodSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, chmodSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1094,4 +1094,23 @@ test('echoed user requests in Git patches never count as CLI option implementati
   const meta=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
   assert.equal(meta.prompts_file,resolve(dirname(driver),'..','prompts',f.frozen.task+'.json'));
   assert.equal(meta.popups_shown,0);
+});
+
+test('existing Layer 0 grader accepts the driver run metadata unchanged',()=>{
+  const f=fullFrozenFixture();
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const harness=resolve(dirname(driver),'..');
+  const runs=join(harness,'runs');mkdirSync(runs,{recursive:true});
+  const out=mkdtempSync(join(runs,'driver-grade-test-'));
+  try {
+    const r=invoke(f,['--execute','--agent-bin='+agent,'--out='+out],{MOCK_HISTORY:join(f.root,'history.jsonl')});
+    assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
+    const meta=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
+    assert.equal(meta.prompts_file,resolve(harness,'prompts',f.frozen.task+'.json'));
+    assert.equal(meta.popups_shown,0);
+    const grade=spawnSync(process.execPath,[join(harness,'grading','grade-run.mjs'),
+      '--run='+out.slice(runs.length+1)],{cwd:harness,encoding:'utf8'});
+    assert.equal(grade.status,0,grade.stderr+'\n'+grade.stdout);
+    assert.equal(existsSync(join(out,'grades.csv')),true);
+  } finally { rmSync(out,{recursive:true,force:true}); }
 });
