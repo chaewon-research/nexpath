@@ -53,6 +53,8 @@ rejected. It supports both arms:
   using a private PTY from `runner/pty-run.py`. Accepted `additionalContext`
   reaches the agent, while an explicit UserPromptSubmit block sends nothing.
   Each standalone run gets a fresh run-local `session.db`.
+  Every hook invocation records its exact JSON stdin alongside stdout,
+  stderr, and PTY logs. Treat run artifacts as potentially sensitive data.
   From the second turn onward, `auto` receives the real Claude Code session
   transcript path, located from the real HOME by session id rather than guessed
   from the project slug. Continuation prompts also carry this path.
@@ -74,7 +76,12 @@ rejected. It supports both arms:
   duration. The standalone run DB records `advisory_frequency`, selected by
   `--level=optimum` (default) or `--level=every_event`, and provides separate
   popup-prepared and popup-shown fields, fired flags, and section counts.
-  The run metadata records source versions and the empty Claude setting sources.
+  Popup preparation comes from the enhancement row. A displayed popup is
+  counted only when `session_states.state_json.shownPopupCount` increases,
+  not when a row is merely marked consumed (`status: "shown"`).
+  The run metadata records source versions, empty Claude setting sources,
+  and whether the real HOME has Claude hook settings (event names and counts,
+  never command contents).
   Processed NexPath handoffs require `--from-runner` and consistent hook-outcome
   fields and accepted `submit` values. The driver does not re-invoke their hooks.
 
@@ -94,7 +101,7 @@ rejected. It supports both arms:
   `~/.nexpath/config.json` fallback, but NexPath can still read credentials
   from the login-session OS keychain. Consequently, `--no-key` does not
   guarantee a credential-free run on a machine with a stored key.
-  `meta.json` records `keychain_sandboxed: false`. Complete isolation
+  `meta.json` records `credential_isolation.keychain_sandboxed: false`. Complete isolation
   requires a separate environment or a change to NexPath's credential resolver.
 - **End-to-end live guidance remains unverified.** Offline tests exercise the
   private PTY and enhanced-prompt forwarding with mock processes, but no live
@@ -117,11 +124,20 @@ subjective reply assumptions: missing evidence is marked `false`, not guessed.
 They are reported for auditing, **never** counted as SWE-EVO scores.
 See `--help` for every flag.
 
-Then grade the popups it produced:
+For Layer 0 grading, choose an output directory beneath `runs/`, for example
+`--out=runs/driver-01` (relative to the harness directory). The driver writes
+`runs/driver-01/meta.json` with `prompts_file` and `popups_shown`, and
+`runs/driver-01/popups/<NN>.txt` with the popup body, excluding the
+UserPromptSubmit wrapper. Enhanced continuation popup bodies are saved under
+`popups/continuations/` so their extra filenames cannot be misread as
+numbered frozen prompts by the existing grader. No grading code is changed.
 
 ```bash
-node grading/grade-run.mjs --run=<run-id>
+node grading/grade-run.mjs --run=driver-01
 ```
+
+Stop decisions (including malformed or capped guidance) are recorded on the
+original turn and summarized in `meta.json`.
 
 Every script takes `--help`.
 
