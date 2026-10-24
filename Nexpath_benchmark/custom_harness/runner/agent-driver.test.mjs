@@ -1025,3 +1025,70 @@ test('continuation audit compares enhanced body with injected guidance, not froz
   assert.equal(cont[0].keeps_original_verbatim,true);
   assert.notEqual(cont[0].submitted_guidance_sha256,cont[0].injected_guidance_sha256);
 });
+
+test('gradeable popup files strip only NexPath wrapper and preserve hook stdin payloads',()=>{
+  const f=fixtureNexpath();
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const hook=join(f.root,'popup-with-wrapper.cjs');
+  writeFileSync(hook,"#!/usr/bin/env node\nconst fs=require('fs');\nconst args=process.argv.slice(2);\nconst hook=args[0];\nlet data='';process.stdin.on('data',x=>data+=x);\nprocess.stdin.on('end',()=>{\n  const payload=JSON.parse(data);\n  fs.appendFileSync(process.env.MOCK_HISTORY,JSON.stringify({kind:'nexpath',hook,payload})+'\\n');\n  if(hook==='auto'&&payload.prompt==='prompt 1'){\n    const body='## My original request (verbatim)\\nprompt 1\\n\\n## Review\\nCheck the import-url behavior';\n    const wrapper='The user explicitly selected this validated Nexpath enhanced prompt.\\nTreat it as the operative task context; it preserves the original request and adds preparation guidance.\\n\\n';\n    console.log(JSON.stringify({hookSpecificOutput:{hookEventName:'UserPromptSubmit',additionalContext:wrapper+body}}));\n  }\n});\n"+'\n');chmodSync(hook,0o755);
+  const home=join(f.root,'real-home');
+  mkdirSync(join(home,'.claude'),{recursive:true});
+  writeFileSync(join(home,'.claude','settings.json'),JSON.stringify({
+    hooks:{UserPromptSubmit:[{hooks:[{type:'command',command:'do-not-copy'}]}],Stop:[{hooks:[{},{}]}]},
+  }));
+  const out=join(f.root,'out'),history=join(f.root,'history.jsonl');
+  const res=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+hook,'--out='+out],{MOCK_HISTORY:history,HOME:home});
+  assert.equal(res.status,0,res.stderr+'\n'+res.stdout);
+  const body=readFileSync(join(out,'popups','01.txt'),'utf8');
+  assert.equal(body,'## My original request (verbatim)\nprompt 1\n\n## Review\nCheck the import-url behavior');
+  assert.equal(existsSync(join(out,'popups','02.txt')),false);
+  const meta=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
+  assert.equal(meta.popups_shown,1);
+  assert.deepEqual(meta.host_claude_hooks.hook_event_keys,['Stop','UserPromptSubmit']);
+  assert.equal(meta.host_claude_hooks.hooks_key_present,true);
+  assert.equal(meta.host_claude_hooks.hook_entry_count,2);
+  assert.equal(meta.host_claude_hooks.registered_hook_count,3);
+  assert.equal(JSON.stringify(meta).includes('do-not-copy'),false);
+  const payload=JSON.parse(readFileSync(join(out,'turn-01-auto-stdin.json'),'utf8'));
+  assert.equal(payload.prompt,'prompt 1');
+  assert.equal(payload.permission_mode,'bypassPermissions');
+  assert.equal(JSON.parse(readFileSync(join(out,'turn-01-stop-stdin.json'),'utf8')).hook_event_name,'Stop');
+  assert.equal(existsSync(join(out,'turn-02-auto-stdin.json')),true);
+});
+
+test('normal turns save Stop outcomes and total malformed and undelivered guidance',()=>{
+  const f=fixtureNexpath();
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const cli=join(f.root,'stop-outcomes.cjs'),plan=join(f.root,'plan.json'),counter=join(f.root,'counter.txt');
+  writeMockNexpathStopPlan(cli,plan,counter);
+  writeFileSync(plan,JSON.stringify(['{"decision":"block"', {decision:'block',reason:'fix the broken test'}]));
+  const out=join(f.root,'outputs');
+  const run=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+cli,
+    '--max-continuations=0','--out='+out],{MOCK_HISTORY:join(f.root,'history.jsonl'),
+    MOCK_STOP_PLAN:plan,MOCK_STOP_COUNTER:counter});
+  assert.equal(run.status,0,run.stderr+'\n'+run.stdout);
+  const results=readFileSync(join(out,'agent-results.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(results.map(x=>x.hook_outcome),['malformed','accepted']);
+  assert.equal(typeof results[0].hook_detail,'string');
+  assert.equal(results[1].continuation_limit_reached,true);
+  const meta=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
+  assert.equal(meta.audit_totals.malformed_stop_decisions,1);
+  assert.equal(meta.audit_totals.undelivered_guidance_turns,1);
+});
+
+test('echoed user requests in Git patches never count as CLI option implementation',()=>{
+  const f=fullFrozenFixture();
+  const agent=join(f.root,'echo-agent.cjs');
+  writeFileSync(agent,"#!/usr/bin/env node\nconst fs=require('fs');\nconst args=process.argv.slice(2), prompt=args[args.indexOf('-p')+1];\nconst counter=process.env.MOCK_FIT_COUNTER;\nconst n=fs.existsSync(counter)?Number(fs.readFileSync(counter,'utf8'))+1:1;\nfs.writeFileSync(counter,String(n));\nfs.appendFileSync('notes.txt','step: '+prompt+'\\n');\nconsole.log(JSON.stringify({session_id:'echo-session',is_error:false,subtype:'success',num_turns:1,result:'done'}));\n"+'\n');chmodSync(agent,0o755);
+  const out=join(f.root,'out');
+  const run=invoke(f,['--execute','--agent-bin='+agent,'--out='+out],
+    {MOCK_FIT_COUNTER:join(f.root,'counter.txt')});
+  assert.equal(run.status,0,run.stderr+'\n'+run.stdout);
+  const fits=readFileSync(join(out,'fits.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(fits[6].fits,false);
+  assert.equal(fits[7].fits,false);
+  assert.match(fits[7].evidence,/not found/);
+  const meta=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
+  assert.equal(meta.prompts_file,resolve(dirname(driver),'..','prompts',f.frozen.task+'.json'));
+  assert.equal(meta.popups_shown,0);
+});
