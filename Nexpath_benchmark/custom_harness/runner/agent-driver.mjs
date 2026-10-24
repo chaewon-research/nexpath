@@ -637,6 +637,24 @@ function patchFiles(diff) {
 function addedLines(diff) {
   return diff.split('\n').filter((line) => line.startsWith('+') && !line.startsWith('+++'));
 }
+// Only code-added lines in import-url source files can establish that a flag
+// was implemented. Echoed user prompts and enhancement wrappers are not evidence.
+function implementationFlagLines(diff) {
+  const frozenLines = (frozenEntries ?? []).flatMap((entry) => entry.text.split('\n'))
+    .map((line) => line.trim()).filter((line) => line.length >= 8);
+  let path = '';
+  const found = [];
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('+++ b/')) { path = line.slice(6); continue; }
+    if (!line.startsWith('+') || line.startsWith('+++') || !importUrlFile(path)) continue;
+    const text = line.slice(1).trim();
+    if (!text || /^(?:#|\/\/|\*)/.test(text)) continue;
+    if (frozenLines.some((prompt) => text.includes(prompt))) continue;
+    if (/The user explicitly selected this validated Nexpath enhanced prompt|Treat it as the operative task context/.test(text)) continue;
+    found.push({ path, text });
+  }
+  return found;
+}
 function fitForEntry(entry, turn) {
   const check = entry.check;
   if (check === 'always fits') return { fits: true, evidence: 'unconditional frozen prompt' };
@@ -646,7 +664,8 @@ function fitForEntry(entry, turn) {
   const precedingDiff = turnObservation(turn).diff_before;
   const changed = patchFiles(precedingDiff);
   const additions = addedLines(precedingDiff);
-  let fits = false, evidence = '';
+  const implementationLines = implementationFlagLines(precedingDiff);
+  let fits = false, evidence = '', matchedLine = null;
   switch (check) {
     case 'transcript: a test path was read in turn 2':
       fits = (observedTurns.get(2)?.tools ?? []).some((c) => c.name === 'Read' && testFile(toolFile(c)));
@@ -664,14 +683,21 @@ function fitForEntry(entry, turn) {
       fits = earlierCalls.some((c) => ['Edit','Write'].includes(c.name));
       evidence = 'Edit or Write tool use before turn';
       break;
-    case 'diff: a new CLI option was added before this turn':
-      fits = additions.some((line) => /--no-download|(?:add_option|\.option\(|@click\.option|Option\()/i.test(line));
-      evidence = 'added CLI option in cumulative pre-turn patch';
+    case 'diff: a new CLI option was added before this turn': {
+      const match = implementationLines.find((x) =>
+        /--no-download/.test(x.text) && /['"`]|(?:add_option|\.option\(|@click\.option|add_argument)/i.test(x.text));
+      fits = Boolean(match);
+      matchedLine = match ? `${match.path}: +${match.text}` : null;
+      evidence = 'added CLI option in import-url source before turn';
       break;
-    case 'diff: the flag name appears in the diff so far':
-      fits = precedingDiff.includes('--no-download');
-      evidence = '--no-download in cumulative pre-turn patch';
+    }
+    case 'diff: the flag name appears in the diff so far': {
+      const match = implementationLines.find((x) => x.text.includes('--no-download'));
+      fits = Boolean(match);
+      matchedLine = match ? `${match.path}: +${match.text}` : null;
+      evidence = '--no-download in added import-url source before turn';
       break;
+    }
     case 'transcript: the reply to turn 8 proposed a change': {
       const reply = observedTurns.get(8)?.reply ?? '';
       fits = /(?:I (?:can|would|will) |(?:we|you) (?:should|could) |(?:I |we )?(?:suggest|recommend|propos))(?:(?:.|\n){0,100})(?:chang|updat|add|modif|implement|fix|adjust|patch)/i.test(reply);
@@ -707,7 +733,8 @@ function fitForEntry(entry, turn) {
     default:
       fail('unsupported frozen assumption check on turn ' + turn + ': ' + check);
   }
-  return { fits, evidence: (fits ? 'matched: ' : 'not found: ') + evidence };
+  return { fits, evidence: (fits ? 'matched: ' : 'not found: ') + evidence
+    + (matchedLine ? '; line: ' + matchedLine.slice(0, 240) : '') };
 }
 
 let sessionId = null;
