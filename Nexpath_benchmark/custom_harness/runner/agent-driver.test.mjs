@@ -1116,3 +1116,37 @@ test('existing Layer 0 grader accepts the driver run metadata unchanged',()=>{
     assert.equal(existsSync(join(out,'grades.csv')),true);
   } finally { rmSync(out,{recursive:true,force:true}); }
 });
+
+test('real Layer 0 grader grades a nonempty popup emitted by the driver',()=>{
+  const f=fullFrozenFixture();
+  const metaPath=join(f.run,'meta.json');
+  const meta=JSON.parse(readFileSync(metaPath,'utf8'));
+  meta.arm='nexpath';
+  writeFileSync(metaPath,JSON.stringify(meta));
+  const agent=join(f.root,'mock-agent.cjs');writeMockAgent(agent);
+  const hook=join(f.root,'grader-popup-hook.cjs');
+  writeFileSync(hook,"#!/usr/bin/env node\nconst fs=require('fs');\nlet input='';\nprocess.stdin.on('data',x=>input+=x);\nprocess.stdin.on('end',()=>{\n  const hook=process.argv[2];\n  const payload=JSON.parse(input);\n  fs.appendFileSync(process.env.MOCK_HISTORY,JSON.stringify({kind:'nexpath',hook})+'\\n');\n  if(hook==='auto'&&payload.prompt===process.env.MOCK_FIRST_PROMPT){\n    const wrapper='The user explicitly selected this validated Nexpath enhanced prompt.\\nTreat it as the operative task context; it preserves the original request and adds preparation guidance.\\n\\n';\n    const body='## My original request (verbatim)\\n'+payload.prompt+'\\n\\n## Review\\nCheck the DVC import-url code path and verify the --no-download option behavior.';\n    console.log(JSON.stringify({hookSpecificOutput:{hookEventName:'UserPromptSubmit',additionalContext:wrapper+body}}));\n  }\n});"+'\n');
+  chmodSync(hook,0o755);
+  const harness=resolve(dirname(driver),'..');
+  const runs=join(harness,'runs');mkdirSync(runs,{recursive:true});
+  const out=mkdtempSync(join(runs,'driver-popup-grade-test-'));
+  rmSync(out,{recursive:true,force:true});
+  try {
+    const res=invoke(f,['--execute','--agent-bin='+agent,'--nexpath-cli='+hook,'--out='+out],
+      {MOCK_HISTORY:join(f.root,'history.jsonl'),MOCK_FIRST_PROMPT:f.rows[0].raw_prompt});
+    assert.equal(res.status,0,res.stderr+'\n'+res.stdout);
+    const body=readFileSync(join(out,'popups','01.txt'),'utf8');
+    assert.ok(body.startsWith('## My original request (verbatim)'));
+    assert.doesNotMatch(body,/The user explicitly selected this validated Nexpath enhanced prompt/);
+    const info=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
+    assert.equal(info.popups_shown,1);
+    assert.equal(info.prompts_file,resolve(harness,'prompts',f.frozen.task+'.json'));
+    const grade=spawnSync(process.execPath,[join(harness,'grading','grade-run.mjs'),
+      '--run='+out.slice(runs.length+1)],{cwd:harness,encoding:'utf8'});
+    assert.equal(grade.status,0,grade.stderr+'\n'+grade.stdout);
+    assert.match(grade.stdout,/popups graded\s*:\s*1/);
+    const csv=readFileSync(join(out,'grades.csv'),'utf8');
+    assert.match(csv,/"Review"/);
+    assert.doesNotMatch(csv,/no sections parsed/);
+  } finally { rmSync(out,{recursive:true,force:true}); }
+});
