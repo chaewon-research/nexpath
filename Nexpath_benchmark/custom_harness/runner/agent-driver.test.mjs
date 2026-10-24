@@ -1102,6 +1102,8 @@ test('existing Layer 0 grader accepts the driver run metadata unchanged',()=>{
   const harness=resolve(dirname(driver),'..');
   const runs=join(harness,'runs');mkdirSync(runs,{recursive:true});
   const out=mkdtempSync(join(runs,'driver-grade-test-'));
+  // Reserve a unique name, then release it: the driver must create its output directory.
+  rmSync(out,{recursive:true,force:true});
   try {
     const r=invoke(f,['--execute','--agent-bin='+agent,'--out='+out],{MOCK_HISTORY:join(f.root,'history.jsonl')});
     assert.equal(r.status,0,r.stderr+'\n'+r.stdout);
