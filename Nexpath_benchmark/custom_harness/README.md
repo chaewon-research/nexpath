@@ -128,9 +128,11 @@ For Layer 0 grading, choose an output directory beneath `runs/`, for example
 `--out=runs/driver-01` (relative to the harness directory). The driver writes
 `runs/driver-01/meta.json` with `prompts_file` and `popups_shown`, and
 `runs/driver-01/popups/<NN>.txt` with the popup body, excluding the
-UserPromptSubmit wrapper. Enhanced continuation popup bodies are saved under
-`popups/continuations/` so their extra filenames cannot be misread as
-numbered frozen prompts by the existing grader. No grading code is changed.
+UserPromptSubmit wrapper. Here, `popups_shown` counts only numbered popup files
+that the grader reads. Enhanced continuation popup bodies are saved under
+`popups/continuations/` and counted separately in
+`continuation_popup_files_written`. The total, including both kinds, remains
+in `audit_totals.popup_files_written`. No grading code is changed.
 
 ```bash
 node grading/grade-run.mjs --run=driver-01
