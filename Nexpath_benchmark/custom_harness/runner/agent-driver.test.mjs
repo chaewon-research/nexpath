@@ -1025,7 +1025,10 @@ test('continuation audit compares enhanced body with injected guidance, not froz
   assert.equal(cont[0].keeps_original_verbatim,true);
   assert.equal(readFileSync(join(out,'popups','continuations','01-cont-01.txt'),'utf8'),
     'please add a regression test\n\nNexPath: check it');
-  assert.equal(JSON.parse(readFileSync(join(out,'meta.json'),'utf8')).popups_shown,1);
+  const popupMeta=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
+  assert.equal(popupMeta.popups_shown,0); // only a continuation popup, no numbered files
+  assert.equal(popupMeta.continuation_popup_files_written,1);
+  assert.equal(popupMeta.audit_totals.popup_files_written,1);
   assert.notEqual(cont[0].submitted_guidance_sha256,cont[0].injected_guidance_sha256);
 });
 
@@ -1047,6 +1050,8 @@ test('gradeable popup files strip only NexPath wrapper and preserve hook stdin p
   assert.equal(existsSync(join(out,'popups','02.txt')),false);
   const meta=JSON.parse(readFileSync(join(out,'meta.json'),'utf8'));
   assert.equal(meta.popups_shown,1);
+  assert.equal(meta.continuation_popup_files_written,0);
+  assert.equal(meta.audit_totals.popup_files_written,1);
   assert.deepEqual(meta.host_claude_hooks.hook_event_keys,['Stop','UserPromptSubmit']);
   assert.equal(meta.host_claude_hooks.hooks_key_present,true);
   assert.equal(meta.host_claude_hooks.hook_entry_count,2);
