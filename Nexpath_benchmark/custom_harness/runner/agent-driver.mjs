@@ -246,6 +246,8 @@ const popupDir = join(out, 'popups');
 const continuationPopupDir = join(popupDir, 'continuations');
 mkdirSync(popupDir, { recursive: true });
 let popupsWritten = 0;
+let numberedPopupsWritten = 0;
+let continuationPopupsWritten = 0;
 function writePopup(turn, additionalContext, step = null) {
   const directory = step == null ? popupDir : continuationPopupDir;
   mkdirSync(directory, { recursive: true });
@@ -253,6 +255,8 @@ function writePopup(turn, additionalContext, step = null) {
   const filename = step == null ? `${n}.txt` : `${n}-cont-${String(step).padStart(2, '0')}.txt`;
   writeFileSync(join(directory, filename), popupBody(additionalContext));
   popupsWritten += 1;
+  if (step == null) numberedPopupsWritten += 1;
+  else continuationPopupsWritten += 1;
 }
 
 // Seed the fresh run DB before the first hook without touching global settings.
@@ -935,7 +939,8 @@ if (frozenEntries) {
 }
 const recordedSteps = [...readLines('agent-results.jsonl'), ...readLines('continuations.jsonl')];
 finalMeta.finished_at = new Date().toISOString();
-finalMeta.popups_shown = popupsWritten;
+finalMeta.popups_shown = numberedPopupsWritten;
+finalMeta.continuation_popup_files_written = continuationPopupsWritten;
 if (arm === 'nexpath' && !preprocessedNexpath) finalMeta.advisory_frequency = readLevel();
 finalMeta.audit_totals = {
   popup_prepared: recordedSteps.filter((x) => x.popup_prepared === true).length,
